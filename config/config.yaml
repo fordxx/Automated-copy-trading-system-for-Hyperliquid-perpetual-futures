@@ -1,0 +1,48 @@
+# Hyperliquid Copy Trader Configuration
+
+# 监控的目标地址
+target_address: "0x0000000000000000000000000000000000000000"
+
+# 排除的地址列表 (避免跟单自己的交易或其他不需要的地址)
+exclude_addresses:
+  - "0x0000000000000000000000000000000000000000"  # 替换为你的地址
+
+# 跟单配置
+copy_trading:
+  enabled: true
+  copy_ratio: 0.1  # 跟单比例 (0.1 = 10% of target position)
+  max_position_size: 1.0  # 最大仓位大小 (合约数量)
+  min_trade_size: 0.01  # 最小交易大小
+  max_leverage: 5  # 最大杠杆
+
+# 风险控制
+risk_management:
+  max_drawdown: 0.1  # 最大回撤 (10%)
+  stop_loss_ratio: 0.05  # 止损比例 (5%)
+  take_profit_ratio: 0.1  # 止盈比例 (10%)
+
+# Hyperliquid 交易所配置
+hyperliquid:
+  account_address: ""  # 你的钱包地址
+  private_key: ""  # 私钥 (请妥善保管)
+  vault_address: ""  # 金库地址 (可选)
+  use_testnet: false  # 是否使用测试网
+
+# 监控配置
+monitoring:
+  poll_interval: 30  # 轮询间隔 (秒)
+  max_retries: 3  # 最大重试次数
+  retry_delay: 5  # 重试延迟 (秒)
+
+# 日志配置
+logging:
+  level: INFO
+  file: logs/copy_trader.log
+  max_size: 10485760  # 10MB
+  backup_count: 5
+
+# Telegram通知配置
+telegram:
+  enabled: false  # 是否启用Telegram通知
+  bot_token: ""   # Telegram机器人令牌 (从 @BotFather 获取)
+  chat_id: ""     # 你的Telegram用户ID (从 @userinfobot 获取)

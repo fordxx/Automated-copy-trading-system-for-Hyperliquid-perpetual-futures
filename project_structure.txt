@@ -1,0 +1,19 @@
+hyperliquid-copy-trader/
+├── README.md
+├── requirements.txt
+├── config/
+│   └── config.yaml
+├── src/
+│   ├── __init__.py
+│   ├── copy_trader.py
+│   ├── trade_monitor.py
+│   ├── position_manager.py
+│   └── utils/
+│       ├── __init__.py
+│       └── helpers.py
+├── tests/
+│   ├── __init__.py
+│   └── test_copy_trader.py
+└── scripts/
+    ├── run_copy_trader.py
+    └── setup.sh
