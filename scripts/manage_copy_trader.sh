@@ -70,8 +70,14 @@ start_service() {
     return 0
   fi
 
-  # 用 nohup 后台启动；run_copy_trader.py 内部有单实例锁（防止多开）
-  nohup "$PY" "$RUNNER" >> "$LOG_STDOUT" 2>&1 &
+  # 关键：必须把服务进程彻底与当前终端/进程组分离。
+  # 否则在本菜单里 tail -f 按 Ctrl+C（SIGINT）时，可能会把服务一起中断。
+  # 优先用 setsid 创建新 session；否则退化到 nohup，并强制 stdin=/dev/null。
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$PY" "$RUNNER" >> "$LOG_STDOUT" 2>&1 < /dev/null
+  else
+    nohup "$PY" "$RUNNER" >> "$LOG_STDOUT" 2>&1 < /dev/null &
+  fi
 
   # 等一会儿让程序写 PID 文件、输出日志
   sleep 0.8
@@ -142,7 +148,7 @@ restart_service() {
 
 tail_logs() {
   echo_line
-  echo "📜 实时查看日志（按 Ctrl+C 退出查看）"
+  echo "📜 实时查看日志（按 Ctrl+C 退出查看；不会停止服务）"
   echo "1) service_stdout.log（启动/STDOUT）"
   echo "2) copy_trader.log（应用日志）"
   read -rp "请选择 [1-2]：" choice
