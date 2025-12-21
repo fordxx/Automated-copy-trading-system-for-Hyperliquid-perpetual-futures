@@ -1,13 +1,12 @@
 """Tests for Hyperliquid Copy Trader."""
 import unittest
 from unittest.mock import Mock, patch
-import asyncio
 
 from src.trade_monitor import TradeMonitor, MonitoredTrade, TradeAction
 from src.position_manager import PositionManager, Position
 
 
-class TestTradeMonitor(unittest.TestCase):
+class TestTradeMonitor(unittest.IsolatedAsyncioTestCase):
     """Test cases for TradeMonitor."""
 
     def setUp(self):
@@ -19,14 +18,16 @@ class TestTradeMonitor(unittest.TestCase):
         # Mock the info client
         mock_info = Mock()
         mock_info_class.return_value = mock_info
+        self.monitor.info_client = mock_info
 
         # Mock user fills response
+        fill_time_ms = self.monitor.last_check_timestamp + 1
         mock_fills = [
             {
                 "coin": "BTC",
                 "sz": "0.1",
                 "px": "50000",
-                "time": 1638360000000,
+                "time": fill_time_ms,
                 "hash": "0xabc123",
                 "side": "B",
                 "leverage": "5"
@@ -45,7 +46,7 @@ class TestTradeMonitor(unittest.TestCase):
         self.assertEqual(trade.price, 50000.0)
 
 
-class TestPositionManager(unittest.TestCase):
+class TestPositionManager(unittest.IsolatedAsyncioTestCase):
     """Test cases for PositionManager."""
 
     def setUp(self):
@@ -95,16 +96,4 @@ class TestPositionManager(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    # Run async tests
-    async def run_async_tests():
-        loader = unittest.TestLoader()
-        suite = loader.loadTestsFromTestCase(TestTradeMonitor)
-        suite.addTests(loader.loadTestsFromTestCase(TestPositionManager))
-
-        runner = unittest.TextTestRunner(verbosity=2)
-        result = await asyncio.get_event_loop().run_until_complete(
-            asyncio.gather(*[test() for test in suite])
-        )
-        runner.run(suite)
-
-    asyncio.run(run_async_tests())
+    unittest.main(verbosity=2)

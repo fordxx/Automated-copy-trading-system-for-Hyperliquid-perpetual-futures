@@ -76,6 +76,43 @@ class TelegramNotifier:
             logger.error(f"Error sending Telegram message: {e}")
             return False
 
+    async def get_updates(self, offset: Optional[int] = None, timeout_s: int = 30) -> list[dict]:
+        """Fetch incoming updates for this bot via long polling.
+
+        This enables simple operator-in-the-loop approvals (reply YES/NO).
+
+        Args:
+            offset: Telegram update offset (use last_update_id + 1 to avoid old updates)
+            timeout_s: Long-poll timeout in seconds
+
+        Returns:
+            List of update dicts.
+        """
+        if not self.session:
+            await self.initialize()
+
+        try:
+            url = f"{self.base_url}/getUpdates"
+            params: dict[str, Any] = {
+                "timeout": int(max(0, timeout_s)),
+                "allowed_updates": ["message"],
+            }
+            if offset is not None:
+                params["offset"] = int(offset)
+
+            async with self.session.get(url, params=params) as response:
+                data = await response.json()
+                if not data.get("ok"):
+                    logger.error(f"Failed to get Telegram updates: {data}")
+                    return []
+                result = data.get("result")
+                if isinstance(result, list):
+                    return result
+                return []
+        except Exception as e:
+            logger.error(f"Error getting Telegram updates: {e}")
+            return []
+
     async def send_trade_notification(self, trade_data: Dict[str, Any]):
         """发送交易通知。
 

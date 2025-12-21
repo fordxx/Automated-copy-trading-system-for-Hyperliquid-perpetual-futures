@@ -127,6 +127,18 @@ python scripts/test_telegram.py YOUR_BOT_TOKEN YOUR_CHAT_ID
 python scripts/run_copy_trader.py
 ```
 
+## 一键启动（推荐：带菜单）
+
+如果你不想记命令，直接使用菜单脚本：
+
+```bash
+cd new_project
+chmod +x scripts/manage_copy_trader.sh
+./scripts/manage_copy_trader.sh
+```
+
+菜单里可以：一键启动/停止/重启、查看进程状态、实时看日志。
+
 ## 安全提醒
 
 ⚠️ **重要安全注意事项：**
