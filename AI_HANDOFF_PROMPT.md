@@ -366,14 +366,33 @@ cd /home/fordxx/perp-tools/copybot
 source .venv/bin/activate
 
 # 3. 查看当前仓位差异（已有脚本）
-python3 analyze_solutions.py
+.venv/bin/python analyze_solutions.py
 
 # 4. 创建并测试同步脚本
-python3 scripts/sync_positions.py --dry-run
+.venv/bin/python scripts/sync_positions.py --dry-run
 
 # 5. 执行同步（确认无误后）
-python3 scripts/sync_positions.py --execute
+.venv/bin/python scripts/sync_positions.py --execute
 ```
+
+## 当前实现状态（已落地）
+
+### 1) 仓位纠偏（Position Sync）
+- 主程序已加入定时纠偏（可选启用，默认更安全）：按 `Leader当前仓位 * COPY_RATIO` 计算目标仓位，并在满足价格门控时做补差。
+- 价格门控（更严格）：默认 `POSITION_SYNC_PRICE_REF_MODE=strict_fill_open`（用 leader 最近一次 OPEN 成交价做参考，当前 mid 需“严格更优”）。
+- 防打架：`POSITION_SYNC_SKIP_RECENT_TRADE_S`（leader 刚成交的币短时间不纠偏）。
+- 点差门控（默认关闭）：`POSITION_SYNC_SPREAD_GATE_ENABLED` + `POSITION_SYNC_MAX_SPREAD_BPS`。
+- 手动干预语义：手动把某币平到 0 后，纠偏不会再补回（直到 leader 该币仓位归零才解锁重置）。
+
+### 2) 断线恢复补单（Catch-up）
+- 为避免“重启/重连重复开仓导致仓位翻倍”，默认 **不回放 OPEN**：`CATCHUP_REPLAY_OPENS=false`（只回放 CLOSE 更安全）。
+- Catch-up 仍可开启 Telegram 二次确认（YES/CONFIRM）。
+
+### 3) 最小 $10 名义金额拒单的处理
+- 已增加平仓缓冲：遇到 `Order must have minimum value of $10` 的小额平仓请求不会再报错刷屏，而是缓存等待凑够再平（见 `MIN_ORDER_NOTIONAL_USD`）。
+
+### 4) Telegram 降噪
+- 对 `skipped`（如“无仓位平仓”“数量过小”）做节流：`TELEGRAM_SKIPPED_TRADE_THROTTLE_S`。
 
 ## 联系方式
 
@@ -384,5 +403,5 @@ python3 scripts/sync_positions.py --execute
 
 ---
 
-**最后更新**: 2025-12-25
-**问题状态**: 待解决 - 需要实现仓位同步功能
+**最后更新**: 2025-12-26
+**问题状态**: 已解决（仓位同步/纠偏已实现并上线运行）
