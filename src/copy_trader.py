@@ -1392,6 +1392,26 @@ class HyperliquidCopyTrader:
             summary = self.position_manager.get_positions_summary()
             total_pnl = summary.get('total_pnl', 0.0)
             total_positions = int(summary.get('total_positions', 0) or 0)
+            positions = summary.get('positions', []) or []
+
+            # Enrich status with per-position notional in USD (mid price).
+            total_notional_usd = 0.0
+            try:
+                mids = await self.position_manager.get_mid_prices()
+            except Exception:
+                mids = {}
+            for p in positions:
+                try:
+                    coin = str(p.get('coin', '') or '')
+                    size = float(p.get('size', 0.0) or 0.0)
+                    mid = float(mids.get(coin, 0.0) or 0.0)
+                    notional = abs(size) * mid if mid > 0 else 0.0
+                    p['mid_price'] = mid
+                    p['notional_usd'] = notional
+                    total_notional_usd += notional
+                except Exception:
+                    continue
+            summary['total_notional_usd'] = float(total_notional_usd)
 
             logger.info(
                 f"Status: {total_positions} positions, "

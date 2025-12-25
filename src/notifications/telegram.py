@@ -271,19 +271,57 @@ class TelegramNotifier:
         try:
             total_positions = status_data.get('total_positions', 0)
             total_pnl = status_data.get('total_pnl', 0)
+            total_notional = status_data.get('total_notional_usd')
 
             message = f"📊 状态报告\n\n"
             message += f"📂 持仓数量: {total_positions}\n"
             message += f"💰 总盈亏: ${total_pnl:.2f}\n"
+            if total_notional is not None:
+                try:
+                    message += f"🧾 持仓名义: ${float(total_notional):.2f}\n"
+                except Exception:
+                    pass
 
             positions = status_data.get('positions', [])
             if positions:
                 message += "\n📋 持仓详情:\n"
-                for pos in positions[:5]:  # 只显示前5个
-                    direction = "多头" if pos.get('size', 0) > 0 else "空头"
-                    message += f"• {pos.get('coin')} {direction}: {abs(pos.get('size', 0)):.4f} @ ${pos.get('entry_price', 0):.2f}\n"
+                # Prefer sorting by notional desc when provided.
+                try:
+                    positions = sorted(positions, key=lambda p: float(p.get('notional_usd', 0) or 0), reverse=True)
+                except Exception:
+                    pass
 
-            await self.send_message(message)
+                lines: list[str] = []
+                for pos in positions:
+                    try:
+                        coin = str(pos.get('coin', '') or '')
+                        size = float(pos.get('size', 0) or 0)
+                        direction = "多头" if size > 0 else "空头"
+                        entry = float(pos.get('entry_price', 0) or 0)
+                        mid = float(pos.get('mid_price', 0) or 0)
+                        notional = float(pos.get('notional_usd', 0) or 0)
+                        lines.append(f"• {coin} {direction}: {abs(size):.4f} @ ${entry:.4f} | 现价 ${mid:.4f} | ≈${notional:.2f}")
+                    except Exception:
+                        direction = "多头" if pos.get('size', 0) > 0 else "空头"
+                        lines.append(f"• {pos.get('coin')} {direction}: {abs(pos.get('size', 0)):.4f} @ ${pos.get('entry_price', 0):.2f}")
+
+                # Telegram text limit is ~4096 chars. Chunk to be safe.
+                max_len = 3800
+                chunk = message
+                sent_any = False
+                for line in lines:
+                    if len(chunk) + len(line) + 1 > max_len:
+                        await self.send_message(chunk)
+                        sent_any = True
+                        chunk = "📊 状态报告（续）\n\n" + line + "\n"
+                    else:
+                        chunk += line + "\n"
+                if chunk.strip():
+                    await self.send_message(chunk)
+                elif not sent_any:
+                    await self.send_message(message)
+            else:
+                await self.send_message(message)
 
         except Exception as e:
             logger.error(f"Error sending status notification: {e}")

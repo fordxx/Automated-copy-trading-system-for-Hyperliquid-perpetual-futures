@@ -955,6 +955,10 @@ class PositionManager:
             ]
         }
 
+    async def get_mid_prices(self) -> Dict[str, float]:
+        """Get current mid prices map {coin: mid} (cached)."""
+        return await self._get_mid_prices()
+
     # -------------------------
     # Position sync (ratio fix)
     # -------------------------
