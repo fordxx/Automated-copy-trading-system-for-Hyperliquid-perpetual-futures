@@ -99,6 +99,10 @@ class PositionManager:
         self._manual_position_cooldown_s = float(os.getenv('POSITION_SYNC_MANUAL_COOLDOWN_S', '0') or 0)
         self._manual_position_grace_s = float(os.getenv('POSITION_SYNC_MANUAL_GRACE_S', '30') or 30)
         self._manual_sync_cooldown_until_by_coin: Dict[str, float] = {}
+        # Stronger behavior: after a manual flatten, never rebuild that coin via ratio-sync until
+        # the leader fully closes (leader position goes to 0), at which point we "reset" the coin.
+        self._manual_lock_until_leader_flat = os.getenv('POSITION_SYNC_MANUAL_LOCK_UNTIL_LEADER_FLAT', 'true').lower() == 'true'
+        self._manual_locked_since_by_coin: Dict[str, float] = {}
         # Track last successful bot order per coin to avoid misclassifying bot closes as manual.
         self._last_bot_order_by_coin: Dict[str, Dict[str, Any]] = {}
 
@@ -188,6 +192,8 @@ class PositionManager:
                         if recently_bot_closed:
                             continue
                         self._manual_sync_cooldown_until_by_coin[str(coin)] = now + float(self._manual_position_cooldown_s)
+                        if self._manual_lock_until_leader_flat:
+                            self._manual_locked_since_by_coin[str(coin)] = now
                         logger.warning(
                             "🛑 Manual position flatten detected: %s (prev=%s). Disabling ratio-sync for %.0fs",
                             str(coin),
@@ -1077,15 +1083,30 @@ class PositionManager:
         l2_cache: Dict[str, Dict[str, float]] = {}
 
         for coin in coins:
-            if self.is_ratio_sync_blocked(coin):
-                skipped.append({"coin": str(coin), "reason": "manual_cooldown"})
-                continue
             leader_size = float(leader_positions.get(coin, {}).get("size", 0.0))
             leader_entry_px = float(leader_positions.get(coin, {}).get("entry_px", 0.0))
 
             follower_pos = self.get_position(coin)
             follower_size = float(follower_pos.size) if follower_pos else 0.0
             follower_entry_px = float(follower_pos.entry_price) if follower_pos else 0.0
+
+            # If manually flattened, never rebuild via ratio-sync until leader is fully flat again.
+            if str(coin) in self._manual_locked_since_by_coin:
+                if abs(float(leader_size)) > 0:
+                    skipped.append({"coin": str(coin), "reason": "manual_lock_until_leader_flat"})
+                    continue
+                # Leader is flat -> reset lock/cooldown for this coin.
+                try:
+                    self._manual_locked_since_by_coin.pop(str(coin), None)
+                    self._manual_sync_cooldown_until_by_coin.pop(str(coin), None)
+                    logger.warning("🔓 Manual lock cleared for %s (leader is flat)", str(coin))
+                except Exception:
+                    pass
+
+            # Time-based cooldown (optional): skip any ratio-sync attempts for this coin.
+            if self.is_ratio_sync_blocked(coin):
+                skipped.append({"coin": str(coin), "reason": "manual_cooldown_active"})
+                continue
 
             expected = float(leader_size) * float(copy_ratio)
             mid = float(mids.get(coin, 0.0) or 0.0)

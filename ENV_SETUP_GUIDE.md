@@ -87,6 +87,8 @@ POSITION_SYNC_MAX_SPREAD_BPS=0
 # 如果你手动把某个币的仓位平掉，纠偏不会立刻把它“补回去”，而是冷却一段时间。
 POSITION_SYNC_MANUAL_COOLDOWN_S=0
 POSITION_SYNC_MANUAL_GRACE_S=30
+# 更强的语义（推荐 true）：手动平掉后，不会通过“纠偏”补回，直到 leader 该币仓位归零才重置。
+POSITION_SYNC_MANUAL_LOCK_UNTIL_LEADER_FLAT=true
 
 # Telegram通知 (可选)
 TELEGRAM_ENABLED=true
