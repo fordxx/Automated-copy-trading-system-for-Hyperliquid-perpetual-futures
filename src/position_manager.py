@@ -3,7 +3,7 @@
 负责管理跟单账户的仓位。
 """
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 
 import asyncio
