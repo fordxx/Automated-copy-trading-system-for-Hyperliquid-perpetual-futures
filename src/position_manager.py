@@ -94,6 +94,14 @@ class PositionManager:
         self._flip_wait_poll_s = float(os.getenv('FLIP_WAIT_POLL_S', '0.75'))
         self._flip_open_on_timeout = os.getenv('FLIP_OPEN_ON_TIMEOUT', 'false').lower() == 'true'
 
+        # Manual intervention cooldown:
+        # If you manually flatten a position, ratio-sync should not "rebuild" it for a while.
+        self._manual_position_cooldown_s = float(os.getenv('POSITION_SYNC_MANUAL_COOLDOWN_S', '0') or 0)
+        self._manual_position_grace_s = float(os.getenv('POSITION_SYNC_MANUAL_GRACE_S', '30') or 30)
+        self._manual_sync_cooldown_until_by_coin: Dict[str, float] = {}
+        # Track last successful bot order per coin to avoid misclassifying bot closes as manual.
+        self._last_bot_order_by_coin: Dict[str, Dict[str, Any]] = {}
+
         logger.info("✅ PositionManager initialized")
 
     async def initialize(self):
@@ -162,6 +170,33 @@ class PositionManager:
                 )
 
                 new_positions[coin] = position
+
+            # Detect manual flatten events (position existed -> gone) to set sync cooldown per coin.
+            try:
+                if self._manual_position_cooldown_s and self._manual_position_cooldown_s > 0:
+                    now = time.monotonic()
+                    removed = set(self.positions.keys()) - set(new_positions.keys())
+                    for coin in removed:
+                        prev = self.positions.get(coin)
+                        if not prev or float(prev.size) == 0:
+                            continue
+                        last = self._last_bot_order_by_coin.get(coin) or {}
+                        last_kind = str(last.get("kind", "") or "")
+                        last_ts = float(last.get("ts", 0.0) or 0.0)
+                        # If we recently submitted a close, don't treat it as manual.
+                        recently_bot_closed = (last_kind == "close") and ((now - last_ts) <= float(self._manual_position_grace_s))
+                        if recently_bot_closed:
+                            continue
+                        self._manual_sync_cooldown_until_by_coin[str(coin)] = now + float(self._manual_position_cooldown_s)
+                        logger.warning(
+                            "🛑 Manual position flatten detected: %s (prev=%s). Disabling ratio-sync for %.0fs",
+                            str(coin),
+                            float(prev.size),
+                            float(self._manual_position_cooldown_s),
+                        )
+            except Exception:
+                # Never let this logic break normal position updates.
+                pass
 
             self.positions = new_positions
             self._last_positions_update = now
@@ -751,6 +786,10 @@ class PositionManager:
             err = self._extract_order_error(result)
             if err:
                 raise RuntimeError(f"market_open rejected: {err}")
+            try:
+                self._last_bot_order_by_coin[str(coin)] = {"kind": "open", "ts": time.monotonic()}
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Error market_open {coin}: {e}")
             raise
@@ -773,10 +812,24 @@ class PositionManager:
             err = self._extract_order_error(result)
             if err:
                 raise RuntimeError(f"market_close rejected: {err}")
+            try:
+                self._last_bot_order_by_coin[str(coin)] = {"kind": "close", "ts": time.monotonic()}
+            except Exception:
+                pass
             return float(close_size)
         except Exception as e:
             logger.error(f"Error market_close {coin}: {e}")
             raise
+
+    def is_ratio_sync_blocked(self, coin: str) -> bool:
+        """Return True if ratio-sync for this coin is temporarily blocked due to manual intervention."""
+        try:
+            until = float(self._manual_sync_cooldown_until_by_coin.get(str(coin), 0.0) or 0.0)
+        except Exception:
+            return False
+        if until <= 0:
+            return False
+        return time.monotonic() < until
 
     async def _set_leverage(self, coin: str, leverage: int):
         """设置杠杆。"""
@@ -1024,6 +1077,9 @@ class PositionManager:
         l2_cache: Dict[str, Dict[str, float]] = {}
 
         for coin in coins:
+            if self.is_ratio_sync_blocked(coin):
+                skipped.append({"coin": str(coin), "reason": "manual_cooldown"})
+                continue
             leader_size = float(leader_positions.get(coin, {}).get("size", 0.0))
             leader_entry_px = float(leader_positions.get(coin, {}).get("entry_px", 0.0))
 
