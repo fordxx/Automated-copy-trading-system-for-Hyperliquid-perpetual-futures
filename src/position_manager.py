@@ -51,6 +51,7 @@ class SyncOrder:
     expected: float
     leader_entry_px: float
     reference_entry_px: float
+    leader_leverage: int
     sz_decimals: int
 
 
@@ -103,8 +104,27 @@ class PositionManager:
         # the leader fully closes (leader position goes to 0), at which point we "reset" the coin.
         self._manual_lock_until_leader_flat = os.getenv('POSITION_SYNC_MANUAL_LOCK_UNTIL_LEADER_FLAT', 'true').lower() == 'true'
         self._manual_locked_since_by_coin: Dict[str, float] = {}
+        # Manual flatten detection robustness
+        self._manual_zero_confirmations_required = int(os.getenv('POSITION_SYNC_MANUAL_CONFIRMATIONS', '2') or 2)
+        self._manual_removed_confirmations_by_coin: Dict[str, int] = {}
         # Track last successful bot order per coin to avoid misclassifying bot closes as manual.
         self._last_bot_order_by_coin: Dict[str, Dict[str, Any]] = {}
+
+        # Light caching to reduce REST load during sync planning.
+        self._mids_cache: Dict[str, float] = {}
+        self._mids_cache_at = 0.0
+        self._mids_cache_ttl_s = float(os.getenv('POSITION_SYNC_MIDS_TTL_S', '2') or 2)
+        self._fills_cache_at_by_leader: Dict[str, float] = {}
+        self._fills_cache_by_leader: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self._fills_cache_ttl_s = float(os.getenv('POSITION_SYNC_FILLS_TTL_S', '10') or 10)
+        self._l2_cache_at_by_coin: Dict[str, float] = {}
+        self._l2_cache_by_coin: Dict[str, Tuple[float, float, float]] = {}
+        self._l2_cache_ttl_s = float(os.getenv('POSITION_SYNC_L2_TTL_S', '2') or 2)
+        self._spread_unavailable_action = os.getenv('POSITION_SYNC_SPREAD_UNAVAILABLE_ACTION', 'skip').strip().lower()  # skip|ignore
+
+        # Strict price gate optional fallback (time-based).
+        self._strict_gate_max_wait_s = float(os.getenv('POSITION_SYNC_STRICT_MAX_WAIT_S', '0') or 0)
+        self._strict_gate_first_skip_at: Dict[Tuple[str, str], float] = {}
 
         logger.info("✅ PositionManager initialized")
 
@@ -180,6 +200,11 @@ class PositionManager:
                 if self._manual_position_cooldown_s and self._manual_position_cooldown_s > 0:
                     now = time.monotonic()
                     removed = set(self.positions.keys()) - set(new_positions.keys())
+
+                    # reset confirmations for coins that still exist
+                    for coin in set(new_positions.keys()):
+                        self._manual_removed_confirmations_by_coin.pop(str(coin), None)
+
                     for coin in removed:
                         prev = self.positions.get(coin)
                         if not prev or float(prev.size) == 0:
@@ -191,12 +216,27 @@ class PositionManager:
                         recently_bot_closed = (last_kind == "close") and ((now - last_ts) <= float(self._manual_position_grace_s))
                         if recently_bot_closed:
                             continue
-                        self._manual_sync_cooldown_until_by_coin[str(coin)] = now + float(self._manual_position_cooldown_s)
+
+                        k = str(coin)
+                        n = int(self._manual_removed_confirmations_by_coin.get(k, 0) or 0) + 1
+                        self._manual_removed_confirmations_by_coin[k] = n
+                        required = max(1, int(self._manual_zero_confirmations_required))
+                        if n < required:
+                            logger.warning(
+                                "🟡 Manual flatten candidate: %s (prev=%s) confirmation %s/%s",
+                                k,
+                                float(prev.size),
+                                n,
+                                required,
+                            )
+                            continue
+
+                        self._manual_sync_cooldown_until_by_coin[k] = now + float(self._manual_position_cooldown_s)
                         if self._manual_lock_until_leader_flat:
-                            self._manual_locked_since_by_coin[str(coin)] = now
+                            self._manual_locked_since_by_coin[k] = now
                         logger.warning(
                             "🛑 Manual position flatten detected: %s (prev=%s). Disabling ratio-sync for %.0fs",
-                            str(coin),
+                            k,
                             float(prev.size),
                             float(self._manual_position_cooldown_s),
                         )
@@ -873,7 +913,7 @@ class PositionManager:
     # -------------------------
 
     def _positions_from_user_state_with_entry(self, user_state: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-        """Extract {coin: {size, entry_px}} from a Hyperliquid user_state payload."""
+        """Extract {coin: {size, entry_px, leverage}} from a Hyperliquid user_state payload."""
         out: Dict[str, Dict[str, float]] = {}
         asset_positions = user_state.get("assetPositions") if isinstance(user_state, dict) else None
         if not isinstance(asset_positions, list):
@@ -895,15 +935,23 @@ class PositionManager:
                 entry_px = float(position_data.get("entryPx", 0) or 0)
             except Exception:
                 entry_px = 0.0
-            out[str(coin)] = {"size": float(size), "entry_px": float(entry_px)}
+            try:
+                lev = int(position_data.get("leverage", {}).get("value", 1) or 1)
+            except Exception:
+                lev = 1
+            out[str(coin)] = {"size": float(size), "entry_px": float(entry_px), "leverage": float(lev)}
         return out
 
     async def _get_mid_prices(self) -> Dict[str, float]:
+        now = time.monotonic()
+        if self._mids_cache and (now - float(self._mids_cache_at)) <= float(self._mids_cache_ttl_s):
+            return dict(self._mids_cache)
+
         try:
             mids_raw = await asyncio.to_thread(self.info.all_mids)
         except Exception as e:
             logger.warning(f"Failed to fetch mids: {e}")
-            return {}
+            return dict(self._mids_cache) if self._mids_cache else {}
         mids: Dict[str, float] = {}
         if isinstance(mids_raw, dict):
             for k, v in mids_raw.items():
@@ -911,6 +959,9 @@ class PositionManager:
                     mids[str(k)] = float(v)
                 except Exception:
                     continue
+        if mids:
+            self._mids_cache = dict(mids)
+            self._mids_cache_at = now
         return mids
 
     async def _get_best_bid_ask(self, coin: str) -> Optional[Tuple[float, float]]:
@@ -918,6 +969,13 @@ class PositionManager:
         coin = str(coin or "")
         if not coin:
             return None
+        now = time.monotonic()
+        cached = self._l2_cache_by_coin.get(coin)
+        cached_at = float(self._l2_cache_at_by_coin.get(coin, 0.0) or 0.0)
+        if cached and (now - cached_at) <= float(self._l2_cache_ttl_s):
+            bid, ask, _sbps = cached
+            if bid > 0 and ask > 0:
+                return float(bid), float(ask)
         try:
             snap = await asyncio.to_thread(self.info.l2_snapshot, coin)
         except Exception as e:
@@ -940,6 +998,11 @@ class PositionManager:
             return None
         if best_bid <= 0 or best_ask <= 0:
             return None
+        # cache along with spread bps to avoid recalculation
+        mid = (float(best_bid) + float(best_ask)) / 2.0
+        sbps = self._spread_bps(bid=float(best_bid), ask=float(best_ask), mid=float(mid)) or 0.0
+        self._l2_cache_by_coin[coin] = (float(best_bid), float(best_ask), float(sbps))
+        self._l2_cache_at_by_coin[coin] = now
         return float(best_bid), float(best_ask)
 
     def _spread_bps(self, *, bid: float, ask: float, mid: float) -> Optional[float]:
@@ -1057,6 +1120,8 @@ class PositionManager:
         fill_ref_fallback: str = "skip",  # "skip" | "entry"
         spread_gate_enabled: bool = False,
         max_spread_bps: float = 0.0,
+        exclude_recent_trades: Optional[Dict[str, float]] = None,
+        skip_recent_trade_s: float = 0.0,
     ) -> Dict[str, Any]:
         """Plan ratio-sync orders (does not execute)."""
         await self.update_positions(force=True)
@@ -1071,11 +1136,21 @@ class PositionManager:
 
         leader_fill_px_by_coin_side: Dict[str, Dict[str, float]] = {}
         if str(price_ref_mode).strip().lower() == "strict_fill_open":
-            try:
-                fills = await asyncio.to_thread(self.info.user_fills, leader_address)
-                leader_fill_px_by_coin_side = self._latest_open_fill_px_by_coin_side(fills)
-            except Exception as e:
-                logger.warning(f"Failed to fetch leader fills for strict gating: {e}")
+            leader_key = str(leader_address).lower()
+            now = time.monotonic()
+            cached_at = float(self._fills_cache_at_by_leader.get(leader_key, 0.0) or 0.0)
+            cached = self._fills_cache_by_leader.get(leader_key)
+            if cached and (now - cached_at) <= float(self._fills_cache_ttl_s):
+                leader_fill_px_by_coin_side = cached
+            else:
+                try:
+                    fills = await asyncio.to_thread(self.info.user_fills, leader_address)
+                    leader_fill_px_by_coin_side = self._latest_open_fill_px_by_coin_side(fills)
+                    if leader_fill_px_by_coin_side:
+                        self._fills_cache_by_leader[leader_key] = leader_fill_px_by_coin_side
+                        self._fills_cache_at_by_leader[leader_key] = now
+                except Exception as e:
+                    logger.warning(f"Failed to fetch leader fills for strict gating: {e}")
 
         coins = sorted(set(leader_positions.keys()) | set(self.positions.keys()))
         orders: List[SyncOrder] = []
@@ -1085,6 +1160,7 @@ class PositionManager:
         for coin in coins:
             leader_size = float(leader_positions.get(coin, {}).get("size", 0.0))
             leader_entry_px = float(leader_positions.get(coin, {}).get("entry_px", 0.0))
+            leader_leverage = int(float(leader_positions.get(coin, {}).get("leverage", 1.0) or 1.0))
 
             follower_pos = self.get_position(coin)
             follower_size = float(follower_pos.size) if follower_pos else 0.0
@@ -1107,6 +1183,17 @@ class PositionManager:
             if self.is_ratio_sync_blocked(coin):
                 skipped.append({"coin": str(coin), "reason": "manual_cooldown_active"})
                 continue
+
+            # Avoid fighting real-time: skip coins with very recent leader trades.
+            try:
+                if exclude_recent_trades and float(skip_recent_trade_s or 0.0) > 0:
+                    last = exclude_recent_trades.get(str(coin))
+                    if last is not None:
+                        if (time.monotonic() - float(last)) <= float(skip_recent_trade_s):
+                            skipped.append({"coin": str(coin), "reason": "recent_leader_trade"})
+                            continue
+            except Exception:
+                pass
 
             expected = float(leader_size) * float(copy_ratio)
             mid = float(mids.get(coin, 0.0) or 0.0)
@@ -1185,16 +1272,17 @@ class PositionManager:
                         sbps_val = float(cached.get("spread_bps", 0.0) or 0.0)
                         # If we cannot compute spread, be conservative: skip in spread-gated mode.
                         if sbps_val <= 0:
-                            skipped.append(
-                                {
-                                    "coin": coin,
-                                    "kind": kind,
-                                    "size": float(chunk),
-                                    "price": float(mid),
-                                    "reason": f"spread_unavailable:{reason}",
-                                }
-                            )
-                            continue
+                            if str(self._spread_unavailable_action) != "ignore":
+                                skipped.append(
+                                    {
+                                        "coin": coin,
+                                        "kind": kind,
+                                        "size": float(chunk),
+                                        "price": float(mid),
+                                        "reason": f"spread_unavailable:{reason}",
+                                    }
+                                )
+                                continue
 
                         if sbps_val > float(max_spread_bps):
                             skipped.append(
@@ -1226,7 +1314,27 @@ class PositionManager:
                                     reference_entry_px=float(ref_entry),
                                     allow_worse_pct=float(allow_worse_pct),
                                 )
+                            if (not ok) and float(self._strict_gate_max_wait_s or 0.0) > 0 and fill_px > 0:
+                                key = (str(coin), side)
+                                first = float(self._strict_gate_first_skip_at.get(key, 0.0) or 0.0)
+                                now = time.monotonic()
+                                if first <= 0:
+                                    self._strict_gate_first_skip_at[key] = now
+                                elif (now - first) >= float(self._strict_gate_max_wait_s):
+                                    # After waiting long enough, relax to entryPx gating.
+                                    ok = self._is_price_favorable(
+                                        is_buy=bool(is_buy),
+                                        mid=float(mid),
+                                        reference_entry_px=float(ref_entry),
+                                        allow_worse_pct=float(allow_worse_pct),
+                                    )
                             if not ok:
+                                try:
+                                    key = (str(coin), side)
+                                    if key not in self._strict_gate_first_skip_at and fill_px > 0:
+                                        self._strict_gate_first_skip_at[key] = time.monotonic()
+                                except Exception:
+                                    pass
                                 skipped.append(
                                     {
                                         "coin": coin,
@@ -1239,6 +1347,12 @@ class PositionManager:
                                     }
                                 )
                                 continue
+                            # Clear strict-skip timer once eligible.
+                            try:
+                                key = (str(coin), side)
+                                self._strict_gate_first_skip_at.pop(key, None)
+                            except Exception:
+                                pass
                         else:
                             ok = self._is_price_favorable(
                                 is_buy=bool(is_buy),
@@ -1273,6 +1387,7 @@ class PositionManager:
                             expected=float(expected),
                             leader_entry_px=float(leader_entry_px),
                             reference_entry_px=float(ref_entry),
+                            leader_leverage=int(leader_leverage),
                             sz_decimals=int(decimals),
                         )
                     )
@@ -1309,6 +1424,8 @@ class PositionManager:
         fill_ref_fallback: str = "skip",
         spread_gate_enabled: bool = False,
         max_spread_bps: float = 0.0,
+        exclude_recent_trades: Optional[Dict[str, float]] = None,
+        skip_recent_trade_s: float = 0.0,
     ) -> Dict[str, Any]:
         """Execute ratio-sync orders (price-gated)."""
         plan = await self.plan_ratio_sync(
@@ -1324,6 +1441,8 @@ class PositionManager:
             fill_ref_fallback=fill_ref_fallback,
             spread_gate_enabled=spread_gate_enabled,
             max_spread_bps=max_spread_bps,
+            exclude_recent_trades=exclude_recent_trades,
+            skip_recent_trade_s=skip_recent_trade_s,
         )
         if plan.get("status") != "ok":
             return plan
@@ -1346,7 +1465,8 @@ class PositionManager:
                     continue
 
                 if o.kind == "open":
-                    lev = int(default_leverage)
+                    # Prefer leader leverage if present, bounded by default max.
+                    lev = int(getattr(o, "leader_leverage", 0) or 0) or int(default_leverage)
                     if lev < 1:
                         lev = 1
                     await self._set_leverage(o.coin, lev)

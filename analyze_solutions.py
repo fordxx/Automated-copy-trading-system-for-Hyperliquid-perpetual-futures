@@ -8,6 +8,20 @@ from pathlib import Path
 repo_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(repo_root))
 
+def _reexec_in_venv() -> None:
+    """If run outside venv, re-exec with repo .venv when available."""
+    try:
+        in_venv = getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+    except Exception:
+        in_venv = False
+    if in_venv:
+        return
+    vpy = repo_root / ".venv" / "bin" / "python"
+    if vpy.exists() and os.access(vpy, os.X_OK):
+        os.execv(str(vpy), [str(vpy), *sys.argv])
+
+_reexec_in_venv()
+
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 import yaml

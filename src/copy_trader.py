@@ -139,6 +139,9 @@ class HyperliquidCopyTrader:
         self._position_sync_default_leverage = _safe_get_env_int('POSITION_SYNC_DEFAULT_LEVERAGE', 5, min_val=1, max_val=50)
         self._position_sync_task: Optional[asyncio.Task] = None
         self._position_sync_lock = asyncio.Lock()
+        # Track leader-trade recency per coin to avoid sync fighting real-time execution.
+        self._last_leader_trade_at_by_coin: dict[str, float] = {}
+        self._position_sync_skip_recent_trade_s = _safe_get_env_float('POSITION_SYNC_SKIP_RECENT_TRADE_S', 30.0, min_val=0.0, max_val=3600.0)
 
         # 初始化 Hyperliquid 客户端
         self._init_hyperliquid_clients()
@@ -593,6 +596,8 @@ class HyperliquidCopyTrader:
                         fill_ref_fallback=str(self._position_sync_fill_ref_fallback),
                         spread_gate_enabled=bool(self._position_sync_spread_gate_enabled),
                         max_spread_bps=float(self._position_sync_max_spread_bps),
+                        exclude_recent_trades=self._last_leader_trade_at_by_coin,
+                        skip_recent_trade_s=float(self._position_sync_skip_recent_trade_s),
                     )
 
                     if report.get("status") != "ok":
@@ -1228,6 +1233,12 @@ class HyperliquidCopyTrader:
 
     def _submit_trade(self, trade: MonitoredTrade):
         """Submit a trade into the burst batcher."""
+        try:
+            coin = str(getattr(trade, 'coin', '') or '')
+            if coin:
+                self._last_leader_trade_at_by_coin[coin] = time.monotonic()
+        except Exception:
+            pass
         self._trade_batcher.submit(trade)
 
     async def _handle_trade_batch(self, trades: list[MonitoredTrade]):

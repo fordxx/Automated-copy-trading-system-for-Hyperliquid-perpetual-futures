@@ -30,6 +30,20 @@ from hyperliquid.utils import constants
 MIN_NOTIONAL_USD_DEFAULT = 10.0
 
 
+def _reexec_in_venv() -> None:
+    """If user runs `python3 scripts/...` outside venv, re-exec with repo .venv when available."""
+    try:
+        in_venv = getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+    except Exception:
+        in_venv = False
+    if in_venv:
+        return
+    repo_root = Path(__file__).resolve().parent.parent
+    vpy = repo_root / ".venv" / "bin" / "python"
+    if vpy.exists() and os.access(vpy, os.X_OK):
+        os.execv(str(vpy), [str(vpy), *sys.argv])
+
+
 @dataclass(frozen=True)
 class Adjustment:
     coin: str
@@ -252,6 +266,7 @@ def _confirm_or_exit(*, force: bool) -> None:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+    _reexec_in_venv()
     _load_repo_dotenv()
 
     parser = argparse.ArgumentParser(description="Hyperliquid follower 仓位同步脚本")
@@ -335,4 +350,3 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

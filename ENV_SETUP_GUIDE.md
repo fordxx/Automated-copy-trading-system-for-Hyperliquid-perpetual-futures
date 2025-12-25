@@ -79,14 +79,29 @@ POSITION_SYNC_ALLOW_WORSE_PCT=0.0
 # 是否让“减仓/平仓”也受价格门控影响（默认 false：减仓更安全，允许直接执行）
 POSITION_SYNC_GATE_REDUCTIONS=false
 
+# 避免与实时成交打架：leader 某个币刚刚有成交时，短时间内跳过纠偏（秒）
+POSITION_SYNC_SKIP_RECENT_TRADE_S=30
+
 # 额外门控（默认关闭）：点差过大时不纠偏
 POSITION_SYNC_SPREAD_GATE_ENABLED=false
 POSITION_SYNC_MAX_SPREAD_BPS=0
+# 点差拿不到时如何处理（仅在开启点差门控时生效）：skip / ignore
+POSITION_SYNC_SPREAD_UNAVAILABLE_ACTION=skip
+
+# 纠偏 planning 缓存（秒），降低 REST 压力
+POSITION_SYNC_MIDS_TTL_S=2
+POSITION_SYNC_FILLS_TTL_S=10
+POSITION_SYNC_L2_TTL_S=2
+
+# 严格门控可选回退：等待超过该秒数仍不“严格更优”时，回退为 entryPx 门控；0=不回退
+POSITION_SYNC_STRICT_MAX_WAIT_S=0
 
 # 手动干预冷却（默认关闭）：
 # 如果你手动把某个币的仓位平掉，纠偏不会立刻把它“补回去”，而是冷却一段时间。
 POSITION_SYNC_MANUAL_COOLDOWN_S=0
 POSITION_SYNC_MANUAL_GRACE_S=30
+# 需要连续 N 次刷新都确认“仓位已消失”才判定为手动干预（降低误判）
+POSITION_SYNC_MANUAL_CONFIRMATIONS=2
 # 更强的语义（推荐 true）：手动平掉后，不会通过“纠偏”补回，直到 leader 该币仓位归零才重置。
 POSITION_SYNC_MANUAL_LOCK_UNTIL_LEADER_FLAT=true
 

@@ -122,13 +122,18 @@ stop_service() {
     done
   fi
 
-  sleep 1.2
+  # Wait a bit for graceful shutdown.
+  local waited=0
+  while is_running && [[ $waited -lt 6 ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
 
   # 如果还存在，强制杀掉（避免重复下单风险）
   if is_running; then
     echo "⚠️ 仍有残留进程，执行强制停止..."
     pkill -9 -f -- "$RUNNER" || true
-    sleep 0.5
+    sleep 0.8
   fi
 
   if is_running; then

@@ -57,6 +57,8 @@ nano .env
 - `POSITION_SYNC_ENABLED`: 仓位纠偏（默认 false：定期把 follower 仓位拉回 leader*比例）
 - `POSITION_SYNC_PRICE_REF_MODE`: 纠偏价格门控模式（推荐 `strict_fill_open`：当前 mid 必须严格更优）
 - `POSITION_SYNC_SPREAD_GATE_ENABLED`/`POSITION_SYNC_MAX_SPREAD_BPS`: 点差门控（默认关闭，避免宽点差时纠偏）
+- `POSITION_SYNC_SKIP_RECENT_TRADE_S`: 避免与实时成交打架（leader 刚成交的币短时间不纠偏）
+- `POSITION_SYNC_MANUAL_CONFIRMATIONS`/`POSITION_SYNC_MANUAL_LOCK_UNTIL_LEADER_FLAT`: 降低“手动平仓”误判与锁定语义
 
 ### 方式二：YAML配置文件
 
