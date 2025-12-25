@@ -123,6 +123,9 @@ POSITION_SYNC_MANUAL_LOCK_UNTIL_LEADER_FLAT=true
 TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=从BotFather获取的令牌
 TELEGRAM_CHAT_ID=你的Telegram用户ID
+
+# 跳过类通知降噪（秒）：同一币种同一原因在窗口内只推送一次汇总
+TELEGRAM_SKIPPED_TRADE_THROTTLE_S=300
 ```
 
 ### 4. 验证配置

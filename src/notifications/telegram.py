@@ -4,6 +4,8 @@
 """
 import asyncio
 import logging
+import os
+import time
 from typing import Dict, Any, Optional
 import aiohttp
 
@@ -27,6 +29,14 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         self.session: Optional[aiohttp.ClientSession] = None
+
+        # Noise reduction: throttle repeated skipped trade notifications (e.g. many CLOSEs after already flat).
+        try:
+            self._skipped_trade_throttle_s = float(os.getenv("TELEGRAM_SKIPPED_TRADE_THROTTLE_S", "300") or 300)
+        except Exception:
+            self._skipped_trade_throttle_s = 300.0
+        self._skipped_trade_last_sent_at: Dict[str, float] = {}
+        self._skipped_trade_suppressed_count: Dict[str, int] = {}
 
         logger.info("✅ Telegram notifier initialized")
 
@@ -226,6 +236,26 @@ class TelegramNotifier:
             if pnl != 0:
                 pnl_emoji = "📈" if pnl > 0 else "📉"
                 message += f"{pnl_emoji} 盈亏: ${pnl:.2f}\n"
+
+            # Throttle noisy skipped notifications.
+            # We still show an occasional aggregated message so you know it's happening.
+            try:
+                if str(status) == 'skipped' and str(reason) in ('no_follower_position', 'too_small'):
+                    key = f"{coin}:{str(reason)}"
+                    now = time.monotonic()
+                    last = float(self._skipped_trade_last_sent_at.get(key, 0.0) or 0.0)
+                    self._skipped_trade_suppressed_count[key] = int(self._skipped_trade_suppressed_count.get(key, 0) or 0) + 1
+
+                    if float(self._skipped_trade_throttle_s) > 0 and (now - last) < float(self._skipped_trade_throttle_s):
+                        return
+
+                    suppressed = int(self._skipped_trade_suppressed_count.get(key, 0) or 0)
+                    self._skipped_trade_last_sent_at[key] = now
+                    self._skipped_trade_suppressed_count[key] = 0
+                    if suppressed > 1:
+                        message += f"🔕 已合并跳过通知: {suppressed} 次/{int(self._skipped_trade_throttle_s)}s\n"
+            except Exception:
+                pass
 
             await self.send_message(message)
 
