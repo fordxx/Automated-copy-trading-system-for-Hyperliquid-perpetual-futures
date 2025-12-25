@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import json
+import os
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable
@@ -39,6 +40,10 @@ class WebSocketMonitor:
         self.on_trade_callback = on_trade_callback
         self.on_ready_callback = on_ready_callback
 
+        # SDK callbacks may run on a non-async thread. Capture the main asyncio
+        # loop in start() and schedule callbacks thread-safely.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
         # 保存配置，延迟初始化Info客户端
         base_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
         self.base_url = base_url
@@ -47,13 +52,21 @@ class WebSocketMonitor:
 
         # Heartbeat / reconnect settings
         self._last_message_time = time.monotonic()
-        self._idle_timeout_s = 30.0
+        # If no WS message arrives for this long, we reconnect.
+        # Making this configurable helps reduce "idle reconnect" log spam when the
+        # target address is simply inactive.
+        self._idle_timeout_s = float(os.getenv('WEBSOCKET_IDLE_TIMEOUT_S', '30'))
+        # Throttle the repetitive idle reconnect warning.
+        self._idle_reconnect_log_interval_s = float(os.getenv('WEBSOCKET_IDLE_LOG_INTERVAL_S', '300'))
+        self._last_idle_reconnect_log_at = 0.0
         self._reconnect_base_delay_s = 3.0
         self._reconnect_max_delay_s = 60.0
         self._reconnect_attempts = 0
 
         # 状态追踪
-        self.last_check_timestamp = int(datetime.now().timestamp() * 1000)
+        # NOTE: Initialize to 0 so catch-up can use the full CATCHUP_WINDOW_S
+        # on first connection. After that, this will be updated to the latest trade timestamp.
+        self.last_check_timestamp = 0
         self.processed_tx_hashes = set()
         self.is_running = False
         self.snapshot_received = False
@@ -75,12 +88,22 @@ class WebSocketMonitor:
         logger.info(f"✅ WebSocketMonitor initialized for {target_address}")
         logger.info(f"📍 监控起始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"🌐 网络: {'Testnet' if use_testnet else 'Mainnet'}")
+        logger.info(
+            f"🔧 WS idle reconnect: timeout={self._idle_timeout_s:g}s, log_interval={self._idle_reconnect_log_interval_s:g}s"
+        )
 
     async def start(self):
         """启动WebSocket监控。"""
         if self.is_running:
             logger.warning("WebSocket monitor is already running")
             return
+
+        # Capture the loop that owns this monitor so we can schedule work from
+        # SDK callback threads safely.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
         self.is_running = True
         logger.info("🚀 Starting WebSocket monitor...")
@@ -114,17 +137,30 @@ class WebSocketMonitor:
                 self.stats['last_connect_time'] = datetime.now()
 
                 # Run until stopped or idle timeout triggers reconnect.
+                # NOTE: We accept idle connections for extended periods when the target
+                # address is simply not trading. Idle timeout protects against stuck sockets
+                # but should be set high enough to avoid reconnect spam.
                 while self.is_running:
                     await asyncio.sleep(1)
-                    if self.snapshot_received:
-                        idle_for = time.monotonic() - self._last_message_time
-                        if idle_for >= self._idle_timeout_s:
-                            raise RuntimeError(f"WebSocket idle for {idle_for:.1f}s, reconnecting")
+                    idle_for = time.monotonic() - self._last_message_time
+                    if idle_for >= self._idle_timeout_s:
+                        # Reconnect even if we never parsed a snapshot. This protects against
+                        # message-shape mismatches, stuck sockets, and transient network stalls.
+                        raise RuntimeError(f"WebSocket idle for {idle_for:.1f}s, reconnecting")
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(f"🔄 WebSocket monitor reconnect: {e}")
+                msg = str(e)
+                if 'WebSocket idle for' in msg:
+                    now = time.monotonic()
+                    if now - self._last_idle_reconnect_log_at >= self._idle_reconnect_log_interval_s:
+                        self._last_idle_reconnect_log_at = now
+                        logger.warning(f"🔄 WebSocket monitor reconnect: {e}")
+                    else:
+                        logger.debug(f"🔄 WebSocket monitor reconnect: {e}")
+                else:
+                    logger.warning(f"🔄 WebSocket monitor reconnect: {e}")
                 self.stats['reconnects'] += 1
                 self.stats['last_error'] = str(e)
 
@@ -171,6 +207,9 @@ class WebSocketMonitor:
         logger.info("🛑 Stopping WebSocket monitor...")
         self.is_running = False
 
+        # Clear loop reference (monitor is stopping)
+        self._loop = None
+
         # 取消订阅 / 清理连接
         await self._cleanup_connection()
         logger.info("✅ WebSocket stopped")
@@ -185,13 +224,26 @@ class WebSocketMonitor:
             self._last_message_time = time.monotonic()
             self.stats['total_messages'] += 1
 
+            # SDK callbacks are not consistent across versions:
+            # - dict: {channel: ..., data: {...}}
+            # - dict: {isSnapshot: ..., fills: [...]}
+            # - str/bytes: JSON-encoded message
+            payload: Any = self._normalize_ws_payload(message)
+            if not isinstance(payload, dict):
+                return
+
             # 检查是否是快照消息
-            is_snapshot = message.get('isSnapshot', False)
+            is_snapshot = bool(payload.get('isSnapshot', False))
 
             if is_snapshot:
                 self.stats['snapshot_messages'] += 1
                 self.snapshot_received = True
-                logger.info(f"📸 Received snapshot with {len(message.get('fills', []))} fills")
+                fills_for_log = payload.get('fills', [])
+                if isinstance(fills_for_log, dict):
+                    fills_for_log = [fills_for_log]
+                if not isinstance(fills_for_log, list):
+                    fills_for_log = []
+                logger.info(f"📸 Received snapshot with {len(fills_for_log)} fills")
                 # 快照消息只用于初始化，不触发交易
 
                 # Fire a one-time ready callback per connection so the owner can do
@@ -199,7 +251,7 @@ class WebSocketMonitor:
                 if (not self._ready_fired_for_connection) and self.on_ready_callback:
                     self._ready_fired_for_connection = True
                     try:
-                        asyncio.create_task(self._invoke_ready_callback())
+                        self._schedule_coroutine(self._invoke_ready_callback())
                     except Exception:
                         pass
                 return
@@ -207,22 +259,79 @@ class WebSocketMonitor:
                 self.stats['streaming_messages'] += 1
 
             # 获取fills数据
-            fills = message.get('fills', [])
+            fills: Any = payload.get('fills', payload.get('fill', []))
+            if isinstance(fills, dict):
+                fills = [fills]
+            if not isinstance(fills, list):
+                fills = []
 
             if not fills:
                 return
 
             logger.info(f"⚡ Received {len(fills)} new fills from WebSocket")
 
+            # Some payloads include the user at the envelope level instead of per-fill.
+            default_user = payload.get('user', '') if isinstance(payload.get('user', ''), str) else ''
+
             # 处理每个fill
             for fill in fills:
-                self._process_fill(fill)
+                if isinstance(fill, dict):
+                    self._process_fill(fill, default_user=default_user)
 
         except Exception as e:
             logger.error(f"Error handling WebSocket message: {e}")
             logger.debug(f"Message content: {message}")
 
-    def _process_fill(self, fill: Dict[str, Any]):
+    def _normalize_ws_payload(self, message: Any) -> Any:
+        """Normalize SDK callback payload into a dict when possible.
+
+        The Hyperliquid Python SDK may emit dicts or raw JSON strings/bytes.
+        This function best-effort parses/unwraps without throwing.
+        """
+        try:
+            payload: Any = message
+
+            # bytes/bytearray -> decode
+            if isinstance(payload, (bytes, bytearray)):
+                try:
+                    payload = payload.decode('utf-8', errors='ignore')
+                except Exception:
+                    return None
+
+            # str -> json
+            if isinstance(payload, str):
+                s = payload.strip()
+                if s.startswith('{') or s.startswith('['):
+                    try:
+                        payload = json.loads(s)
+                    except Exception:
+                        return None
+                else:
+                    return None
+
+            # dict envelope -> unwrap data when present
+            if isinstance(payload, dict):
+                inner = payload.get('data')
+                # Sometimes 'data' itself is a JSON string.
+                if isinstance(inner, (bytes, bytearray)):
+                    try:
+                        inner = inner.decode('utf-8', errors='ignore')
+                    except Exception:
+                        inner = None
+                if isinstance(inner, str):
+                    try:
+                        inner = json.loads(inner)
+                    except Exception:
+                        inner = None
+                if isinstance(inner, dict):
+                    return inner
+                return payload
+
+            return payload
+        except Exception:
+            return None
+
+    def _process_fill(self, fill: Dict[str, Any], default_user: str = ''):
         """处理单个fill数据。
 
         Args:
@@ -230,7 +339,10 @@ class WebSocketMonitor:
         """
         try:
             # 检查排除地址
-            user = fill.get('user', '').lower()
+            user_val = fill.get('user')
+            if not isinstance(user_val, str) or not user_val:
+                user_val = default_user
+            user = user_val.lower() if isinstance(user_val, str) else ''
             if user in self.exclude_addresses:
                 logger.debug(f"Skipping fill from excluded address: {user}")
                 return
@@ -238,10 +350,24 @@ class WebSocketMonitor:
             # 提取交易信息
             coin = fill.get('coin', 'Unknown')
             side = fill.get('side', 'Unknown')
-            size = float(fill.get('sz', 0))
-            price = float(fill.get('px', 0))
-            timestamp = fill.get('time', 0)
-            tx_hash = fill.get('hash', '')
+            size = float(fill.get('sz', 0) or 0)
+            price = float(fill.get('px', 0) or 0)
+            timestamp = int(fill.get('time', fill.get('timestamp', 0)) or 0)
+
+            # Normalize timestamp to milliseconds.
+            # REST fills use ms; some WS payloads may use seconds.
+            if 0 < timestamp < 10_000_000_000:
+                timestamp *= 1000
+            elif timestamp > 10_000_000_000_000:
+                # Defensive: if we ever see microseconds/nanoseconds.
+                timestamp = int(timestamp / 1000)
+
+            # Dedup key: SDK versions may use different identifiers.
+            tx_hash = fill.get('hash') or fill.get('txHash') or fill.get('tid') or ''
+            if not isinstance(tx_hash, str):
+                tx_hash = str(tx_hash)
+            if not tx_hash:
+                tx_hash = f"{user}:{coin}:{side}:{size}:{price}:{timestamp}"
 
             # 去重检查
             if tx_hash in self.processed_tx_hashes:
@@ -259,23 +385,39 @@ class WebSocketMonitor:
             # 解析交易动作
             from .trade_monitor import MonitoredTrade, TradeAction
 
-            # 判断是开仓还是平仓
-            # 注意：这里的逻辑可能需要结合当前仓位状态来判断
-            # 暂时使用简化逻辑：买入=开多，卖出=开空或平多
-            if side == 'B':
+            # Prefer the API-provided direction field when present to avoid
+            # misclassifying CLOSE/clear trades as opens.
+            dir_text = str(fill.get('dir', '') or '').strip().lower()
+            if dir_text.startswith('open') and 'long' in dir_text:
                 action = TradeAction.OPEN_LONG
-            else:
+            elif dir_text.startswith('open') and 'short' in dir_text:
                 action = TradeAction.OPEN_SHORT
+            elif dir_text.startswith('close') and 'long' in dir_text:
+                action = TradeAction.CLOSE_LONG
+            elif dir_text.startswith('close') and 'short' in dir_text:
+                action = TradeAction.CLOSE_SHORT
+            else:
+                # Fallback: buy->open long, sell->open short
+                action = TradeAction.OPEN_LONG if side == 'B' else TradeAction.OPEN_SHORT
+
+            direction = 'long' if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG) else 'short'
+
+            lev_val = fill.get('leverage', 1)
+            try:
+                leverage = int(lev_val)
+            except Exception:
+                leverage = 1
 
             trade = MonitoredTrade(
                 action=action,
                 coin=coin,
                 size=size,
                 price=price,
-                leverage=1,  # WebSocket数据中可能没有杠杆信息
+                leverage=leverage,
                 timestamp=timestamp,
                 tx_hash=tx_hash,
-                side=side
+                direction=direction,
+                side=side,
             )
 
             # 记录交易
@@ -285,8 +427,8 @@ class WebSocketMonitor:
 
             # 触发回调
             if self.on_trade_callback:
-                # 在异步上下文中调用回调
-                asyncio.create_task(self._invoke_callback(trade))
+                # SDK callback may not run on an asyncio loop thread.
+                self._schedule_coroutine(self._invoke_callback(trade))
 
         except Exception as e:
             logger.error(f"Error processing fill: {e}")
@@ -301,6 +443,50 @@ class WebSocketMonitor:
                 self.on_trade_callback(trade)
         except Exception as e:
             logger.error(f"Error in trade callback: {e}")
+
+    def _schedule_coroutine(self, coro: Any) -> None:
+        """Schedule a coroutine onto the captured asyncio loop.
+
+        Hyperliquid SDK may invoke callbacks from a background thread with no
+        running event loop. In that case, asyncio.create_task() would fail.
+        """
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+
+            def _done(f):
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.error(f"Scheduled coroutine failed: {e}")
+
+            fut.add_done_callback(_done)
+            return
+
+        # Fallback: try to get current running loop
+        try:
+            current_loop = asyncio.get_running_loop()
+            if current_loop.is_running():
+                asyncio.create_task(coro)
+                return
+        except RuntimeError:
+            pass
+
+        # If no loop is available, try to get any event loop
+        try:
+            fallback_loop = asyncio.get_event_loop()
+            if fallback_loop.is_running():
+                asyncio.run_coroutine_threadsafe(coro, fallback_loop)
+                return
+        except Exception:
+            pass
+
+        # Last resort: close the coroutine to prevent warnings
+        try:
+            coro.close()
+        except Exception:
+            pass
+        logger.error(f"Cannot schedule coroutine (no running event loop available). Trade callback may be lost!")
 
     async def _invoke_ready_callback(self):
         try:

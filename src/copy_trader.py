@@ -10,6 +10,7 @@ import time
 from typing import Dict, Any, Optional
 import yaml
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 import secrets
 
@@ -18,13 +19,45 @@ from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
-from .trade_monitor import TradeMonitor, MonitoredTrade
+from .trade_monitor import TradeMonitor, MonitoredTrade, TradeAction
 from .websocket_monitor import WebSocketMonitor
 from .position_manager import PositionManager
 from .notifications import NotificationManager
 from .trade_batcher import TradeBatcher
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_get_env_float(key: str, default: float, min_val: Optional[float] = None, max_val: Optional[float] = None) -> float:
+    """Safely get and validate a float environment variable."""
+    try:
+        value = float(os.getenv(key, str(default)))
+        if min_val is not None and value < min_val:
+            logger.warning(f"Env {key}={value} below minimum {min_val}, using minimum")
+            return min_val
+        if max_val is not None and value > max_val:
+            logger.warning(f"Env {key}={value} above maximum {max_val}, using maximum")
+            return max_val
+        return value
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid env {key}={os.getenv(key)}, using default {default}: {e}")
+        return default
+
+
+def _safe_get_env_int(key: str, default: int, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
+    """Safely get and validate an int environment variable."""
+    try:
+        value = int(os.getenv(key, str(default)))
+        if min_val is not None and value < min_val:
+            logger.warning(f"Env {key}={value} below minimum {min_val}, using minimum")
+            return min_val
+        if max_val is not None and value > max_val:
+            logger.warning(f"Env {key}={value} above maximum {max_val}, using maximum")
+            return max_val
+        return value
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid env {key}={os.getenv(key)}, using default {default}: {e}")
+        return default
 
 
 class HyperliquidCopyTrader:
@@ -34,8 +67,13 @@ class HyperliquidCopyTrader:
     """
 
     def __init__(self, config_path: Optional[str] = None):
-        # Load environment variables
-        load_dotenv()
+        # Load environment variables.
+        # Use an explicit path so detached/background runs don't miss the repo-root .env.
+        try:
+            repo_root = Path(__file__).resolve().parent.parent
+            load_dotenv(dotenv_path=repo_root / '.env', override=False)
+        except Exception:
+            load_dotenv()
 
         self.config = self._load_config(config_path)
         self.running = False
@@ -46,29 +84,35 @@ class HyperliquidCopyTrader:
         self.position_manager: Optional[PositionManager] = None
         self.notification_manager: Optional[NotificationManager] = None
 
+        # Centralized trade deduplication (shared between REST and WS monitors)
+        self._processed_tx_hashes: set[str] = set()
+        self._dedup_lock = asyncio.Lock()
+        self._max_dedup_set_size = _safe_get_env_int('MAX_DEDUP_SET_SIZE', 10000, min_val=100, max_val=100000)
+
         # WebSocket模式标志
         self.use_websocket = os.getenv('USE_WEBSOCKET', 'true').lower() == 'true'
 
         # Burst batching: reduces 429s and order spam when the target opens/closes many trades.
-        batch_window_ms = float(os.getenv('TRADE_BATCH_WINDOW_MS', '500'))
+        batch_window_ms = _safe_get_env_float('TRADE_BATCH_WINDOW_MS', 500.0, min_val=0.0, max_val=10000.0)
         self._trade_batcher = TradeBatcher(window_s=batch_window_ms / 1000.0, on_batch=self._handle_trade_batch)
 
         # Reconnect catch-up (optional): after WS reconnect, backfill a bounded window via REST,
         # but only if the current price is strictly better than the original fill.
         self._catchup_enabled = os.getenv('CATCHUP_ENABLED', 'true').lower() == 'true'
-        self._catchup_window_s = float(os.getenv('CATCHUP_WINDOW_S', '600'))
-        self._catchup_max_trades = int(os.getenv('CATCHUP_MAX_TRADES', '200'))
-        self._catchup_min_interval_s = float(os.getenv('CATCHUP_MIN_INTERVAL_S', '30'))
-        self._catchup_start_delay_s = float(os.getenv('CATCHUP_START_DELAY_S', '0'))
+        self._catchup_window_s = _safe_get_env_float('CATCHUP_WINDOW_S', 600.0, min_val=0.0, max_val=86400.0)
+        self._catchup_max_trades = _safe_get_env_int('CATCHUP_MAX_TRADES', 200, min_val=1, max_val=10000)
+        self._catchup_min_interval_s = _safe_get_env_float('CATCHUP_MIN_INTERVAL_S', 30.0, min_val=0.0)
+        self._catchup_start_delay_s = _safe_get_env_float('CATCHUP_START_DELAY_S', 0.0, min_val=0.0, max_val=3600.0)
         self._last_catchup_at = 0.0
         self._catchup_task: Optional[asyncio.Task] = None
 
         # Operator-in-the-loop approval (Telegram): ask before replaying catch-up trades.
         self._catchup_require_approval = os.getenv('CATCHUP_REQUIRE_APPROVAL', 'false').lower() == 'true'
-        self._catchup_approval_timeout_s = float(os.getenv('CATCHUP_APPROVAL_TIMEOUT_S', '900'))
-        self._catchup_second_confirm_timeout_s = float(os.getenv('CATCHUP_SECOND_CONFIRM_TIMEOUT_S', str(int(self._catchup_approval_timeout_s))))
-        self._catchup_approval_poll_s = float(os.getenv('CATCHUP_APPROVAL_POLL_S', '2'))
-        self._catchup_replay_spacing_s = float(os.getenv('CATCHUP_REPLAY_SPACING_S', '2'))
+        self._catchup_approval_timeout_s = _safe_get_env_float('CATCHUP_APPROVAL_TIMEOUT_S', 900.0, min_val=10.0, max_val=7200.0)
+        default_second_timeout = self._catchup_approval_timeout_s
+        self._catchup_second_confirm_timeout_s = _safe_get_env_float('CATCHUP_SECOND_CONFIRM_TIMEOUT_S', default_second_timeout, min_val=10.0, max_val=7200.0)
+        self._catchup_approval_poll_s = _safe_get_env_float('CATCHUP_APPROVAL_POLL_S', 2.0, min_val=0.2, max_val=60.0)
+        self._catchup_replay_spacing_s = _safe_get_env_float('CATCHUP_REPLAY_SPACING_S', 2.0, min_val=0.0, max_val=60.0)
         self._tg_update_offset: Optional[int] = None
 
         # 初始化 Hyperliquid 客户端
@@ -83,6 +127,34 @@ class HyperliquidCopyTrader:
         self._status_notify_only_when_positions = os.getenv('STATUS_NOTIFY_ONLY_WHEN_POSITIONS', 'true').lower() == 'true'
         self._status_notification_interval = float(os.getenv('STATUS_NOTIFICATION_INTERVAL_S', '1800'))  # 默认 30 分钟
 
+        # Risk alert throttling (avoid spamming Telegram on every status tick).
+        self._risk_alert_min_interval_s = float(os.getenv('RISK_ALERT_MIN_INTERVAL_S', '300'))
+        self._last_risk_alert_at: dict[str, float] = {}
+
+        # Optional: auto-flatten on stop-loss.
+        # NOTE: default is disabled (alerts only). Enable via env:
+        #   RISK_AUTO_CLOSE_ON_STOP_LOSS=true
+        self._risk_auto_close_on_stop_loss = os.getenv('RISK_AUTO_CLOSE_ON_STOP_LOSS', 'false').lower() == 'true'
+        self._risk_auto_close_cooldown_s = float(os.getenv('RISK_AUTO_CLOSE_COOLDOWN_S', '300'))
+        self._risk_auto_close_and_stop = os.getenv('RISK_AUTO_CLOSE_AND_STOP', 'false').lower() == 'true'
+        self._risk_halt_trading_on_stop_loss = os.getenv('RISK_HALT_TRADING_ON_STOP_LOSS', 'true').lower() == 'true'
+        self._stop_loss_exec_in_progress = False
+        self._last_stop_loss_exec_at = 0.0
+        self._trading_halted = False
+        self._trading_halted_reason: Optional[str] = None
+        self._last_halt_log_at = 0.0
+
+        # Optional: auto-close positions on stop-loss trigger (default OFF for safety).
+        self._auto_close_on_stop_loss = os.getenv('RISK_AUTO_CLOSE_ON_STOP_LOSS', 'false').lower() == 'true'
+        self._risk_close_lock = asyncio.Lock()
+
+        if self._risk_auto_close_on_stop_loss:
+            logger.warning(
+                "🧯 Stop-loss auto-close is ENABLED (cooldown=%ss halt=%s stop=%s)",
+                int(self._risk_auto_close_cooldown_s),
+                self._risk_halt_trading_on_stop_loss,
+                self._risk_auto_close_and_stop,
+            )
         logger.info("✅ HyperliquidCopyTrader initialized")
 
     def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
@@ -135,6 +207,14 @@ class HyperliquidCopyTrader:
                                                              config['copy_trading'].get('copy_ratio', 0.1)))
         config['copy_trading']['max_position_size'] = float(os.getenv('MAX_POSITION_SIZE',
                                                                      config['copy_trading'].get('max_position_size', 1.0)))
+        # Optional: cap per-trade notional in USD (e.g. 2000 means ~$2000 max per order).
+        # When set > 0, this is applied in addition to COPY_RATIO.
+        config['copy_trading']['max_notional_per_trade_usd'] = float(
+            os.getenv(
+                'MAX_NOTIONAL_PER_TRADE_USD',
+                config['copy_trading'].get('max_notional_per_trade_usd', 0.0),
+            )
+        )
         config['copy_trading']['min_trade_size'] = float(os.getenv('MIN_TRADE_SIZE',
                                                                   config['copy_trading'].get('min_trade_size', 0.01)))
         config['copy_trading']['max_leverage'] = int(os.getenv('MAX_LEVERAGE',
@@ -285,6 +365,18 @@ class HyperliquidCopyTrader:
         self.running = True
         logger.info("🚀 Starting Hyperliquid Copy Trader")
 
+        if self._risk_auto_close_on_stop_loss:
+            logger.warning(
+                "🧯 Stop-loss auto-close ENABLED: cooldown=%ss halt=%s stop=%s",
+                int(self._risk_auto_close_cooldown_s),
+                self._risk_halt_trading_on_stop_loss,
+                self._risk_auto_close_and_stop,
+            )
+
+        # 初始化 PositionManager（预热 szDecimals 缓存）
+        if self.position_manager:
+            await self.position_manager.initialize()
+
         # 初始化通知
         if self.notification_manager:
             await self.notification_manager.initialize()
@@ -292,7 +384,23 @@ class HyperliquidCopyTrader:
             await self._notify_startup_config_summary()
 
         # 设置信号处理
+        # Background runs (setsid/nohup with stdin=/dev/null) should not be stoppable
+        # by stray SIGINT (signal 2). We still stop on SIGTERM for service management.
+        ignore_sigint_when_detached = os.getenv('IGNORE_SIGINT_WHEN_DETACHED', 'true').lower() == 'true'
+        is_detached = not sys.stdin.isatty()
+        _last_sigint_log_at = 0.0
+
         def signal_handler(signum, frame):
+            nonlocal _last_sigint_log_at
+
+            if signum == signal.SIGINT and ignore_sigint_when_detached and is_detached:
+                now = time.time()
+                # Throttle logs in case something is spamming SIGINT.
+                if now - _last_sigint_log_at >= 60:
+                    logger.warning("Ignoring SIGINT (signal 2) because process is detached")
+                    _last_sigint_log_at = now
+                return
+
             logger.info(f"Received signal {signum}, stopping...")
             self.running = False
 
@@ -320,6 +428,24 @@ class HyperliquidCopyTrader:
 
             logger.info("🛑 Hyperliquid Copy Trader stopped")
 
+    async def _is_trade_processed(self, tx_hash: str) -> bool:
+        """Check if a trade has already been processed (thread-safe)."""
+        async with self._dedup_lock:
+            return tx_hash in self._processed_tx_hashes
+
+    async def _mark_trade_processed(self, tx_hash: str) -> None:
+        """Mark a trade as processed, with bounded set size (thread-safe)."""
+        async with self._dedup_lock:
+            self._processed_tx_hashes.add(tx_hash)
+            # Prune oldest entries if set grows too large (FIFO-like behavior)
+            if len(self._processed_tx_hashes) > self._max_dedup_set_size:
+                # Remove approximately 10% of oldest entries
+                to_remove = len(self._processed_tx_hashes) - int(self._max_dedup_set_size * 0.9)
+                # Convert to list, remove first N items, then recreate set
+                items = list(self._processed_tx_hashes)
+                self._processed_tx_hashes = set(items[to_remove:])
+                logger.debug(f"Pruned {to_remove} old tx_hashes from dedup set")
+
     async def _notify_startup_config_summary(self) -> None:
         """Send a one-shot startup self-check summary to Telegram.
 
@@ -343,6 +469,7 @@ class HyperliquidCopyTrader:
                 "*跟单设置*",
                 f"跟单比例（COPY_RATIO）: `{copy_cfg.get('copy_ratio')}`",
                 f"最大仓位（MAX_POSITION_SIZE）: `{copy_cfg.get('max_position_size')}`",
+                f"单笔名义上限（MAX_NOTIONAL_PER_TRADE_USD）: `{copy_cfg.get('max_notional_per_trade_usd')}`",
                 f"最大杠杆（MAX_LEVERAGE）: `{copy_cfg.get('max_leverage')}`",
                 "",
                 "*稳定性/限流设置*",
@@ -542,40 +669,53 @@ class HyperliquidCopyTrader:
         If enabled, we do a bounded REST catch-up for missed fills, but only
         replay those with strictly better current prices.
         """
+        logger.info("📞 on_ready callback triggered (WebSocket snapshot received)")
         if not self._catchup_enabled:
+            logger.info("⏭️ Catch-up disabled (CATCHUP_ENABLED=false)")
             return
         if not self.running:
+            logger.debug("⏭️ Catch-up skipped: not running")
             return
         if not self.use_websocket:
+            logger.debug("⏭️ Catch-up skipped: not using websocket")
             return
 
         if self._catchup_task and not self._catchup_task.done():
+            logger.debug("⏭️ Catch-up already in progress")
             return
 
         async def _runner():
             # Optional delay: if you don't want immediate REST calls on reconnect,
             # wait a bit and let the system stabilize.
             if self._catchup_start_delay_s > 0:
+                logger.info(f"⏳ Catch-up delaying {self._catchup_start_delay_s}s before start...")
                 await asyncio.sleep(self._catchup_start_delay_s)
 
             now = time.monotonic()
-            if (now - self._last_catchup_at) < self._catchup_min_interval_s:
+            time_since_last = now - self._last_catchup_at
+            if time_since_last < self._catchup_min_interval_s:
+                logger.info(f"⏭️ Catch-up throttled: last run {time_since_last:.1f}s ago (min interval: {self._catchup_min_interval_s}s)")
                 return
             self._last_catchup_at = now
 
+            logger.info("🔄 Starting catch-up process...")
             try:
                 await self._catch_up_missed_trades_strict_better()
             except Exception as e:
                 logger.warning(f"Catch-up skipped due to error: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
 
         self._catchup_task = asyncio.create_task(_runner())
 
     async def _catch_up_missed_trades_strict_better(self):
         if not self.position_manager or not self.ws_monitor:
+            logger.warning("Catch-up skipped: missing position_manager or ws_monitor")
             return
 
         target = self.config.get('target_address', '')
         if not target:
+            logger.warning("Catch-up skipped: no target_address configured")
             return
 
         # If the network was down for hours, we do NOT try to backfill everything.
@@ -584,15 +724,25 @@ class HyperliquidCopyTrader:
         window_ms = int(max(0.0, self._catchup_window_s) * 1000)
         since_ms = max(int(getattr(self.ws_monitor, 'last_check_timestamp', 0) or 0), now_ms - window_ms)
 
+        from datetime import datetime
+        since_dt = datetime.fromtimestamp(since_ms / 1000)
+        logger.info(f"🔍 Catch-up window: from {since_dt} ({self._catchup_window_s}s)")
+
         # Fetch current mids once (1 REST call)
+        logger.debug("Fetching current market prices...")
         mids = await asyncio.to_thread(self.position_manager.info.all_mids)
         if not isinstance(mids, dict) or not mids:
+            logger.warning("Catch-up aborted: failed to fetch market prices")
             return
 
         # Fetch fills once (1 REST call)
+        logger.info(f"📥 Fetching fills for {target}...")
         fills = await asyncio.to_thread(self.position_manager.info.user_fills, target)
         if not fills:
+            logger.info("✅ Catch-up complete: no fills found")
             return
+
+        logger.info(f"📊 Found {len(fills)} total fills, filtering...")
 
         processed = getattr(self.ws_monitor, 'processed_tx_hashes', set())
         exclude = set(getattr(self.ws_monitor, 'exclude_addresses', []) or [])
@@ -637,18 +787,33 @@ class HyperliquidCopyTrader:
                     continue
                 mid = float(mid_raw)
 
-                # Strictly better only:
-                # - If we need to BUY, current mid must be strictly lower.
-                # - If we need to SELL, current mid must be strictly higher.
-                better = (mid < fill_px) if side == 'B' else (mid > fill_px)
-                considered += 1
-                if not better:
-                    processed.add(txh)
-                    continue
-
-                # Build MonitoredTrade (keep semantics aligned with existing logic)
+                # Determine action: prefer dir to avoid misclassifying CLOSE as OPEN.
                 from .trade_monitor import TradeAction
-                action = TradeAction.OPEN_LONG if side == 'B' else TradeAction.OPEN_SHORT
+                dir_text = str(fill.get('dir', '') or '').strip().lower()
+                if dir_text.startswith('open') and 'long' in dir_text:
+                    action = TradeAction.OPEN_LONG
+                elif dir_text.startswith('open') and 'short' in dir_text:
+                    action = TradeAction.OPEN_SHORT
+                elif dir_text.startswith('close') and 'long' in dir_text:
+                    action = TradeAction.CLOSE_LONG
+                elif dir_text.startswith('close') and 'short' in dir_text:
+                    action = TradeAction.CLOSE_SHORT
+                else:
+                    action = TradeAction.OPEN_LONG if side == 'B' else TradeAction.OPEN_SHORT
+
+                is_open = action in (TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT)
+                if is_open:
+                    # Strictly better only for OPENs:
+                    # - If we need to BUY, current mid must be strictly lower.
+                    # - If we need to SELL, current mid must be strictly higher.
+                    better = (mid < fill_px) if side == 'B' else (mid > fill_px)
+                    considered += 1
+                    if not better:
+                        processed.add(txh)
+                        continue
+                else:
+                    # CLOSEs must be replayed for correctness even if price isn't "better".
+                    considered += 1
                 leverage = int(fill.get('leverage', 1) or 1)
                 trade = MonitoredTrade(
                     action=action,
@@ -790,6 +955,11 @@ class HyperliquidCopyTrader:
         out: list[MonitoredTrade] = []
         for t in trades:
             try:
+                # CLOSE trades are always allowed.
+                if getattr(t, 'action', None) in (TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT):
+                    out.append(t)
+                    continue
+
                 mid_raw = mids.get(t.coin)
                 if mid_raw is None:
                     continue
@@ -842,6 +1012,12 @@ class HyperliquidCopyTrader:
         out: list[MonitoredTrade] = []
         for t in trades:
             try:
+                # CLOSE trades should always be allowed: if the target is flat now,
+                # that is precisely when we still need to catch up and close too.
+                if getattr(t, 'action', None) in (TradeAction.CLOSE_LONG, TradeAction.CLOSE_SHORT):
+                    out.append(t)
+                    continue
+
                 szi = float(positions.get(t.coin, 0.0))
                 if szi == 0:
                     continue
@@ -936,34 +1112,112 @@ class HyperliquidCopyTrader:
         start_time = time.time()
 
         try:
+            # Centralized deduplication check
+            tx_hash = getattr(trade, 'tx_hash', None)
+            if tx_hash and await self._is_trade_processed(tx_hash):
+                logger.debug(f"Skipping duplicate trade: {tx_hash}")
+                return
+
             logger.info(f"⚡ Processing new trade: {trade}")
+
+            # Mark trade as processed early to prevent race conditions
+            if tx_hash:
+                await self._mark_trade_processed(tx_hash)
 
             # 检查是否启用跟单
             if not copy_config.get('enabled', True):
                 logger.debug("Copy trading is disabled")
                 return
 
+            # Risk halt: stop accepting new trades after an emergency stop-loss.
+            if self._trading_halted:
+                now = time.time()
+                if (now - self._last_halt_log_at) >= 60:
+                    logger.warning(f"⛔ Trading halted ({self._trading_halted_reason}); skipping new trades")
+                    self._last_halt_log_at = now
+                return
+
             # 获取跟单参数
             copy_ratio = copy_config.get('copy_ratio', 0.1)
             max_size = copy_config.get('max_position_size', 1.0)
             max_leverage = copy_config.get('max_leverage', 5)
+            max_notional = copy_config.get('max_notional_per_trade_usd', 0.0)
+            min_trade_size = copy_config.get('min_trade_size', 0.01)
 
             # 执行跟单
-            await self.position_manager.execute_copy_trade(trade, copy_ratio, max_size, max_leverage=max_leverage)
+            exec_report = await self.position_manager.execute_copy_trade(
+                trade,
+                copy_ratio,
+                max_size,
+                max_leverage=max_leverage,
+                max_notional_per_trade_usd=max_notional,
+                min_trade_size=min_trade_size,
+            )
 
             # 计算响应时间
             response_time = time.time() - start_time
-            logger.info(f"✅ Trade executed in {response_time:.3f}s")
+            # Avoid false positives: distinguish submitted/skipped/error.
+            if isinstance(exec_report, dict):
+                st = exec_report.get('status')
+                rsn = exec_report.get('reason')
+                if st == 'submitted':
+                    if rsn:
+                        logger.info(f"📨 Trade submitted ({rsn}) in {response_time:.3f}s")
+                    else:
+                        logger.info(f"📨 Trade submitted in {response_time:.3f}s")
+                elif st == 'skipped':
+                    logger.info(f"⏭️ Trade skipped ({rsn}) in {response_time:.3f}s")
+                elif st == 'error':
+                    logger.warning(f"❌ Trade failed ({rsn}) in {response_time:.3f}s")
+                else:
+                    logger.info(f"ℹ️ Trade handled (status={st} reason={rsn}) in {response_time:.3f}s")
+            else:
+                logger.info(f"ℹ️ Trade handled in {response_time:.3f}s")
 
             # 发送交易通知
             if self.notification_manager:
+                # Prefer the execution report from PositionManager so the
+                # notification reflects caps (MAX_POSITION_SIZE) and skips.
+                status = None
+                reason = None
+                requested_size = None
+                order_size = None
+                capped_by_size = None
+                capped_by_notional = None
+                rounded_down = None
+                sz_decimals = None
+                min_trade_size_report = None
+                max_notional_report = None
+                if isinstance(exec_report, dict):
+                    status = exec_report.get('status')
+                    reason = exec_report.get('reason')
+                    requested_size = exec_report.get('requested_size')
+                    order_size = exec_report.get('order_size')
+                    capped_by_size = exec_report.get('capped_by_size')
+                    capped_by_notional = exec_report.get('capped_by_notional')
+                    rounded_down = exec_report.get('rounded_down')
+                    sz_decimals = exec_report.get('sz_decimals')
+                    min_trade_size_report = exec_report.get('min_trade_size')
+                    max_notional_report = exec_report.get('max_notional_per_trade_usd')
+
                 trade_data = {
                     'action': trade.action,
                     'coin': trade.coin,
-                    'size': trade.size * copy_ratio,  # 实际跟单大小
                     'price': trade.price,
                     'leverage': trade.leverage,
-                    'response_time': f"{response_time:.3f}s"
+                    'response_time': f"{response_time:.3f}s",
+                    'status': status,
+                    'reason': reason,
+                    # requested_size: leader_size * copy_ratio (before max cap)
+                    'requested_size': requested_size,
+                    # order_size: after caps / partial close sizing
+                    'size': order_size if order_size is not None else (trade.size * copy_ratio),
+                    'capped_by_size': capped_by_size,
+                    'capped_by_notional': capped_by_notional,
+                    'rounded_down': rounded_down,
+                    'sz_decimals': sz_decimals,
+                    'min_trade_size': min_trade_size_report if min_trade_size_report is not None else min_trade_size,
+                    'max_notional_per_trade_usd': max_notional_report if max_notional_report is not None else max_notional,
                 }
                 await self.notification_manager.notify_trade(trade_data)
 
@@ -1002,34 +1256,219 @@ class HyperliquidCopyTrader:
                     await self.notification_manager.notify_status(summary)
                     self._last_status_notification = current_time
 
-            # 检查风险控制
-            await self._check_risk_limits(float(total_pnl))
+            # 检查风险控制（用账户权益计算阈值，避免把比例当成美元）
+            account_value = None
+            if self.position_manager:
+                account_value = self.position_manager.get_account_value_usd()
+            await self._check_risk_limits(float(total_pnl), account_value_usd=account_value)
 
         except Exception as e:
             logger.error(f"Error logging status: {e}")
 
-    async def _check_risk_limits(self, current_pnl: float):
-        """检查风险限制。"""
+    async def _check_risk_limits(self, current_pnl: float, account_value_usd: Optional[float] = None):
+        """检查风险限制。
+
+        Notes:
+        - 配置里的 max_drawdown / stop_loss_ratio 语义是"比例"（例如 0.1=10%），
+          之前误当成"美元"导致阈值极小（$0.10 / $0.05）。
+        - 为兼容老配置：如果值 > 1，则按"绝对美元"处理。
+        """
         risk_config = self.config.get('risk_management', {})
 
-        # 检查最大回撤
-        max_drawdown = float(risk_config.get('max_drawdown', 0.1))
-        if current_pnl < -max_drawdown:
-            logger.warning(f"Max drawdown exceeded: {current_pnl} < -{max_drawdown}")
+        def _to_usd_threshold(v: float, base: Optional[float]) -> Optional[float]:
+            try:
+                v = float(v)
+            except Exception:
+                return None
+            if v <= 0:
+                return None
+            # Validate base is within reasonable bounds to prevent overflow
+            if base is not None:
+                try:
+                    base_float = float(base)
+                    if base_float < 0 or base_float > 1e15:  # Sanity check: max $1 quadrillion
+                        logger.warning(f"Account value out of reasonable bounds: {base_float}")
+                        return None
+                except (ValueError, OverflowError):
+                    logger.warning(f"Invalid account value: {base}")
+                    return None
+            # Treat <=1 as ratio if we have a base.
+            if v <= 1.0:
+                if base is None or base <= 0:
+                    return None
+                return float(base) * v
+            # Treat >1 as absolute USD.
+            return v
 
-            if self.notification_manager:
+        now = time.time()
+        def _can_alert(key: str) -> bool:
+            last = self._last_risk_alert_at.get(key, 0.0)
+            if (now - last) >= self._risk_alert_min_interval_s:
+                self._last_risk_alert_at[key] = now
+                return True
+            return False
+
+        def _can_act(key: str, min_interval_s: float) -> bool:
+            last = self._last_risk_alert_at.get(key, 0.0)
+            if (now - last) >= float(min_interval_s):
+                self._last_risk_alert_at[key] = now
+                return True
+            return False
+
+        # 检查最大回撤
+        max_drawdown_cfg = float(risk_config.get('max_drawdown', 0.1))
+        max_dd_usd = _to_usd_threshold(max_drawdown_cfg, account_value_usd)
+        if max_dd_usd is not None and current_pnl < -max_dd_usd:
+            if _can_alert('max_drawdown_log'):
+                logger.warning(f"Max drawdown exceeded: {current_pnl} < -{max_dd_usd} (cfg={max_drawdown_cfg}, equity={account_value_usd})")
+            else:
+                logger.debug(f"Max drawdown exceeded: {current_pnl} < -{max_dd_usd} (cfg={max_drawdown_cfg}, equity={account_value_usd})")
+
+            if self.notification_manager and _can_alert('max_drawdown'):
+                extra = ""
+                if account_value_usd is not None and account_value_usd > 0 and max_drawdown_cfg <= 1.0:
+                    extra = f"\n账户权益: ${account_value_usd:.2f} (阈值={max_drawdown_cfg*100:.1f}%)"
                 await self.notification_manager.notify_alert(
                     "warning",
-                    f"⚠️ 最大回撤超限!\n当前亏损: ${current_pnl:.2f}\n回撤限制: ${max_drawdown:.2f}",
+                    f"⚠️ 最大回撤超限!\n当前亏损: ${current_pnl:.2f}\n回撤限制: ${max_dd_usd:.2f}{extra}",
                 )
 
         # 检查止损
-        stop_loss_ratio = float(risk_config.get('stop_loss_ratio', 0.05))
-        if current_pnl < -stop_loss_ratio:
-            logger.warning(f"Stop loss triggered: {current_pnl} < -{stop_loss_ratio}")
+        stop_loss_cfg = float(risk_config.get('stop_loss_ratio', 0.05))
+        stop_loss_usd = _to_usd_threshold(stop_loss_cfg, account_value_usd)
+        if stop_loss_usd is not None and current_pnl < -stop_loss_usd:
+            if _can_alert('stop_loss_log'):
+                logger.warning(f"Stop loss triggered: {current_pnl} < -{stop_loss_usd} (cfg={stop_loss_cfg}, equity={account_value_usd})")
+            else:
+                logger.debug(f"Stop loss triggered: {current_pnl} < -{stop_loss_usd} (cfg={stop_loss_cfg}, equity={account_value_usd})")
 
-            if self.notification_manager:
+            if self.notification_manager and _can_alert('stop_loss'):
+                extra = ""
+                if account_value_usd is not None and account_value_usd > 0 and stop_loss_cfg <= 1.0:
+                    extra = f"\n账户权益: ${account_value_usd:.2f} (阈值={stop_loss_cfg*100:.1f}%)"
                 await self.notification_manager.notify_alert(
                     "error",
-                    f"🚨 止损触发!\n当前亏损: ${current_pnl:.2f}\n止损线: ${stop_loss_ratio:.2f}\n建议立即检查!",
+                    f"🚨 止损触发!\n当前亏损: ${current_pnl:.2f}\n止损线: ${stop_loss_usd:.2f}{extra}\n建议立即检查!",
                 )
+
+            # Optional execution: auto-flatten and halt (prevents churn / loops).
+            if self._risk_auto_close_on_stop_loss and self.position_manager:
+                if (not self._stop_loss_exec_in_progress) and _can_act('stop_loss_exec', self._risk_auto_close_cooldown_s):
+                    await self._execute_stop_loss(current_pnl=current_pnl, stop_loss_usd=float(stop_loss_usd))
+
+    async def _execute_stop_loss(self, *, current_pnl: float, stop_loss_usd: float) -> None:
+        """Emergency action when stop-loss triggers.
+
+        Best-effort: attempt to market-close all positions, then optionally halt trading / stop the bot.
+        Uses a lock + cooldown to avoid repeated loops.
+        """
+        if not self.position_manager:
+            return
+
+        if self._stop_loss_exec_in_progress:
+            return
+        self._stop_loss_exec_in_progress = True
+        self._last_stop_loss_exec_at = time.time()
+
+        try:
+            # Force-refresh positions so we close real sizes.
+            try:
+                await self.position_manager.update_positions(force=True, ignore_backoff=True)
+            except Exception:
+                pass
+
+            report = await self.position_manager.close_all_positions()
+            logger.warning(f"🧯 Stop-loss auto-close submitted: pnl={current_pnl:.2f} threshold={stop_loss_usd:.2f} report={report}")
+
+            # Halt trading to avoid immediately re-opening via new leader fills.
+            if self._risk_halt_trading_on_stop_loss:
+                self._trading_halted = True
+                self._trading_halted_reason = "stop_loss"
+
+            # Notify once (throttled by existing stop_loss key)
+            if self.notification_manager:
+                try:
+                    await self.notification_manager.notify_alert(
+                        "error",
+                        "🧯 已执行止损自动平仓（Auto-close）\n"
+                        f"当前亏损: ${current_pnl:.2f}\n"
+                        f"止损线: ${stop_loss_usd:.2f}\n"
+                        f"结果: {report}",
+                    )
+                except Exception:
+                    pass
+
+            # Optional: stop the bot after flatten.
+            if self._risk_auto_close_and_stop:
+                self.running = False
+        finally:
+            self._stop_loss_exec_in_progress = False
+
+    async def _auto_flatten_on_stop_loss(
+        self,
+        current_pnl: float,
+        stop_loss_usd: float,
+        stop_loss_cfg: float,
+        account_value_usd: Optional[float],
+    ) -> None:
+        if not self.position_manager:
+            return
+
+        if self._risk_close_lock.locked():
+            logger.warning("Stop-loss auto-close skipped (already in progress)")
+            return
+
+        async with self._risk_close_lock:
+            try:
+                # Force-refresh positions once before flattening (best effort).
+                try:
+                    await self.position_manager.update_positions(force=True, ignore_backoff=True)
+                except Exception as e:
+                    logger.warning(f"Stop-loss auto-close: forced refresh failed: {e}")
+
+                report = await self.position_manager.close_all_positions()
+                closed = report.get('closed', []) if isinstance(report, dict) else []
+                errors = int(report.get('errors', 0) or 0) if isinstance(report, dict) else 0
+
+                logger.warning(
+                    "Stop-loss auto-close executed: pnl=%s stop_loss_usd=%s cfg=%s equity=%s closed=%s errors=%s",
+                    float(current_pnl),
+                    float(stop_loss_usd),
+                    float(stop_loss_cfg),
+                    account_value_usd,
+                    len(closed) if isinstance(closed, list) else 0,
+                    errors,
+                )
+
+                if self.notification_manager:
+                    # Keep message compact.
+                    lines = [
+                        "🧯 *止损自动平仓已执行*",
+                        f"当前亏损: `${current_pnl:.2f}`",
+                        f"止损线: `${stop_loss_usd:.2f}` (cfg={stop_loss_cfg})",
+                    ]
+                    if account_value_usd is not None and account_value_usd > 0 and stop_loss_cfg <= 1.0:
+                        lines.append(f"账户权益: `${account_value_usd:.2f}`")
+                    if isinstance(closed, list) and closed:
+                        lines.append("\n已提交平仓:")
+                        for item in closed[:10]:
+                            try:
+                                coin = item.get('coin')
+                                csz = float(item.get('closed', 0.0) or 0.0)
+                                req = float(item.get('requested', 0.0) or 0.0)
+                                lines.append(f"- {coin}: {csz:.6g} / {req:.6g}")
+                            except Exception:
+                                continue
+                        if len(closed) > 10:
+                            lines.append(f"... 还有 {len(closed) - 10} 个")
+                    if errors:
+                        lines.append(f"\n⚠️ 平仓过程中有 {errors} 个错误（详见日志）")
+                    await self.notification_manager.notify_alert("error", "\n".join(lines))
+
+            except Exception as e:
+                logger.error(f"Stop-loss auto-close failed: {e}")
+                if self.notification_manager:
+                    try:
+                        await self.notification_manager.notify_alert("error", f"🚨 止损自动平仓失败: {str(e)}")
+                    except Exception:
+                        pass

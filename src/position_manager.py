@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 import asyncio
 import time
+import math
+import os
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -46,6 +48,7 @@ class PositionManager:
         self.exchange = exchange_client
         self.info = info_client
         self.positions: Dict[str, Position] = {}
+        self._last_user_state: Optional[Dict[str, Any]] = None
         self._last_positions_update = 0.0
         # In practice user_state is the most rate-limit-prone call; keep a conservative floor.
         self._min_positions_update_interval = 2.0
@@ -58,19 +61,58 @@ class PositionManager:
         # Debounced refresh to avoid double-refresh per trade burst
         self._refresh_task: Optional[asyncio.Task] = None
 
+        # Cache for per-coin size decimals (szDecimals) to ensure orders meet
+        # exchange precision constraints.
+        self._sz_decimals_by_coin: Dict[str, int] = {}
+        self._sz_decimals_fetched_at = 0.0
+        self._sz_decimals_ttl_s = 3600.0
+        # If we see an unknown coin (cache miss), refresh meta opportunistically.
+        # This prevents using a wrong default precision for newly listed coins.
+        self._sz_decimals_miss_refresh_at = 0.0
+        self._sz_decimals_miss_refresh_cooldown_s = 30.0
+
+        # Flip execution safety: optionally wait until the opposite position is actually closed
+        # before opening the new side.
+        self._flip_wait_for_close = os.getenv('FLIP_WAIT_FOR_CLOSE', 'true').lower() == 'true'
+        self._flip_wait_timeout_s = float(os.getenv('FLIP_WAIT_TIMEOUT_S', '6'))
+        self._flip_wait_poll_s = float(os.getenv('FLIP_WAIT_POLL_S', '0.75'))
+        self._flip_open_on_timeout = os.getenv('FLIP_OPEN_ON_TIMEOUT', 'false').lower() == 'true'
+
         logger.info("✅ PositionManager initialized")
 
-    async def update_positions(self):
-        """更新当前仓位信息。"""
+    async def initialize(self):
+        """Initialize position manager (call after construction).
+
+        Preheats the szDecimals cache to avoid 'Order has invalid size' errors
+        on first trades.
+        """
+        logger.info("Preheating szDecimals cache...")
+        try:
+            await self._refresh_sz_decimals_cache()
+            logger.info(f"✅ szDecimals cache preheated: {len(self._sz_decimals_by_coin)} coins loaded")
+        except Exception as e:
+            logger.warning(f"Failed to preheat szDecimals cache (will retry on demand): {e}")
+
+    async def update_positions(self, force: bool = False, *, ignore_backoff: bool = False):
+        """更新当前仓位信息。
+
+        Args:
+            force: If True, bypass local throttles/backoff and attempt refresh immediately.
+                   Useful for emergency actions (e.g. stop-loss auto-flatten).
+            ignore_backoff: If True, attempt refresh even if we are in a 429 backoff window.
+        """
         try:
             now = time.monotonic()
-            if now < self._backoff_until:
+            if (not ignore_backoff) and (now < self._backoff_until):
                 return
-            if (now - self._last_positions_update) < self._min_positions_update_interval:
-                return
+            if not force:
+                if (now - self._last_positions_update) < self._min_positions_update_interval:
+                    return
 
             # 获取账户仓位（最容易触发 429）
             account_positions = await asyncio.to_thread(self.info.user_state, self.exchange.account_address)
+            if isinstance(account_positions, dict):
+                self._last_user_state = account_positions
 
             if not account_positions or "assetPositions" not in account_positions:
                 logger.debug("No positions found")
@@ -123,6 +165,73 @@ class PositionManager:
 
             logger.error(f"Error updating positions: {e}")
 
+    async def close_all_positions(self) -> Dict[str, Any]:
+        """Attempt to close (flatten) all current positions.
+
+        Returns a report with per-coin close attempts.
+        """
+        results: List[Dict[str, Any]] = []
+
+        # Use the latest cached positions; callers may force-refresh beforehand.
+        snapshot = list(self.positions.values())
+        if not snapshot:
+            return {"status": "noop", "closed": [], "errors": 0}
+
+        errors = 0
+        for pos in snapshot:
+            try:
+                coin = str(pos.coin)
+                size_to_close = abs(float(pos.size))
+                closed = await self._market_close_partial(coin, size_to_close)
+                results.append({"coin": coin, "requested": size_to_close, "closed": float(closed or 0.0)})
+            except Exception as e:
+                errors += 1
+                results.append({"coin": getattr(pos, 'coin', ''), "requested": abs(float(getattr(pos, 'size', 0.0) or 0.0)), "closed": 0.0, "error": str(e)})
+
+        # Refresh lazily after close attempts.
+        try:
+            self.schedule_refresh(delay_s=1.0)
+        except Exception:
+            pass
+
+        return {"status": "submitted", "closed": results, "errors": int(errors)}
+
+    def get_account_value_usd(self) -> Optional[float]:
+        """Return the latest account value (equity) in USD if available.
+
+        This comes from the cached user_state payload. We avoid extra REST calls here.
+        """
+        state = self._last_user_state
+        if not isinstance(state, dict):
+            return None
+
+        # Common shapes seen in Hyperliquid user_state payloads.
+        candidates = [
+            ("marginSummary", "accountValue"),
+            ("crossMarginSummary", "accountValue"),
+            ("summary", "accountValue"),
+        ]
+        for a, b in candidates:
+            try:
+                val = state.get(a, {}).get(b)
+                if val is None:
+                    continue
+                return float(val)
+            except Exception:
+                continue
+
+        # Fallback: some payloads may use a flat key.
+        for key in ("accountValue", "equity", "totalAccountValue"):
+            try:
+                val = state.get(key)
+                if val is None:
+                    continue
+                return float(val)
+            except Exception:
+                continue
+
+        return None
+
     def schedule_refresh(self, delay_s: float = 1.0):
         """Schedule a debounced positions refresh.
 
@@ -141,7 +250,15 @@ class PositionManager:
         """获取指定币种的仓位。"""
         return self.positions.get(coin)
 
-    async def execute_copy_trade(self, trade: MonitoredTrade, copy_ratio: float, max_size: float, max_leverage: int = 5):
+    async def execute_copy_trade(
+        self,
+        trade: MonitoredTrade,
+        copy_ratio: float,
+        max_size: float,
+        max_leverage: int = 5,
+        max_notional_per_trade_usd: float = 0.0,
+        min_trade_size: float = 0.01,
+    ) -> Dict[str, Any]:
         """执行跟单交易（极速开/平）。
 
         策略：
@@ -150,13 +267,166 @@ class PositionManager:
         - SDK 调用全部放到线程，避免阻塞 asyncio 事件循环。
         """
         try:
-            copy_size = min(trade.size * copy_ratio, max_size)
-            if copy_size < 0.01:
-                logger.info(f"Copy size {copy_size} too small, skipping")
-                return
+            requested_size = float(getattr(trade, 'size', 0) or 0) * float(copy_ratio)
+            copy_size_before_caps = float(requested_size)
+            copy_size = float(requested_size)
 
+            # Optional notional cap (USD): cap size based on fill price.
+            px = float(getattr(trade, 'price', 0) or 0)
+            max_notional = float(max_notional_per_trade_usd or 0.0)
+            max_size_contracts = float(max_size)
+            cap_by_size = False
+            cap_by_notional = False
+            if max_size_contracts > 0:
+                if copy_size > max_size_contracts:
+                    cap_by_size = True
+                copy_size = min(copy_size, max_size_contracts)
+            if max_notional > 0 and px > 0:
+                notional_cap_size = max_notional / px
+                if copy_size > notional_cap_size:
+                    cap_by_notional = True
+                copy_size = min(copy_size, notional_cap_size)
+
+            # Round size to allowed precision.
             coin = trade.coin
+            decimals = await self._get_sz_decimals(coin)
+            copy_size_rounded = self._round_down(copy_size, decimals)
+            rounded_down = copy_size_rounded != copy_size
+            copy_size = copy_size_rounded
+            min_sz = float(min_trade_size or 0.0)
+            if copy_size < min_sz:
+                logger.info(f"Copy size {copy_size} too small, skipping")
+                return {
+                    "status": "skipped",
+                    "reason": "too_small",
+                    "coin": trade.coin,
+                    "action": str(trade.action),
+                    "requested_size": float(requested_size),
+                    "order_size": 0.0,
+                    "max_size": float(max_size),
+                    "max_notional_per_trade_usd": float(max_notional),
+                    "min_trade_size": float(min_sz),
+                    "capped_by_size": bool(cap_by_size),
+                    "capped_by_notional": bool(cap_by_notional),
+                    "rounded_down": bool(rounded_down),
+                    "sz_decimals": int(decimals),
+                }
+
             position = self.get_position(coin)
+
+            # Reduce-only semantics: if the leader is closing but we have no position,
+            # do NOT open a reverse position.
+            if trade.action == TradeAction.CLOSE_LONG:
+                if not position or not position.is_long:
+                    pos_size = float(position.size) if position else 0.0
+                    logger.info(
+                        "SKIP CLOSE (no follower position): coin=%s action=%s leader_size=%s copy_ratio=%s copy_size=%s follower_pos=%s",
+                        coin,
+                        trade.action,
+                        float(getattr(trade, 'size', 0) or 0),
+                        float(copy_ratio),
+                        float(copy_size),
+                        pos_size,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "no_follower_position",
+                        "coin": coin,
+                        "action": str(trade.action),
+                        "requested_size": float(requested_size),
+                        "order_size": 0.0,
+                        "max_size": float(max_size),
+                        "max_notional_per_trade_usd": float(max_notional),
+                        "min_trade_size": float(min_sz),
+                        "capped_by_size": bool(cap_by_size),
+                        "capped_by_notional": bool(cap_by_notional),
+                        "rounded_down": bool(rounded_down),
+                        "sz_decimals": int(decimals),
+                        "follower_pos": float(pos_size),
+                    }
+                logger.info(
+                    "EXEC CLOSE: coin=%s action=%s leader_size=%s copy_ratio=%s copy_size=%s follower_pos=%s",
+                    coin,
+                    trade.action,
+                    float(getattr(trade, 'size', 0) or 0),
+                    float(copy_ratio),
+                    float(copy_size),
+                    float(position.size),
+                )
+                closed = await self._market_close_partial(coin, copy_size)
+                self.schedule_refresh(delay_s=1.0)
+                return {
+                    "status": "submitted",
+                    "reason": None,
+                    "coin": coin,
+                    "action": str(trade.action),
+                    "requested_size": float(requested_size),
+                    "order_size": float(closed or 0.0),
+                    "max_size": float(max_size),
+                    "max_notional_per_trade_usd": float(max_notional),
+                    "min_trade_size": float(min_sz),
+                    "capped_by_size": bool(cap_by_size),
+                    "capped_by_notional": bool(cap_by_notional),
+                    "rounded_down": bool(rounded_down),
+                    "sz_decimals": int(decimals),
+                    "follower_pos": float(position.size),
+                }
+
+            if trade.action == TradeAction.CLOSE_SHORT:
+                if not position or not position.is_short:
+                    pos_size = float(position.size) if position else 0.0
+                    logger.info(
+                        "SKIP CLOSE (no follower position): coin=%s action=%s leader_size=%s copy_ratio=%s copy_size=%s follower_pos=%s",
+                        coin,
+                        trade.action,
+                        float(getattr(trade, 'size', 0) or 0),
+                        float(copy_ratio),
+                        float(copy_size),
+                        pos_size,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "no_follower_position",
+                        "coin": coin,
+                        "action": str(trade.action),
+                        "requested_size": float(requested_size),
+                        "order_size": 0.0,
+                        "max_size": float(max_size),
+                        "max_notional_per_trade_usd": float(max_notional),
+                        "min_trade_size": float(min_sz),
+                        "capped_by_size": bool(cap_by_size),
+                        "capped_by_notional": bool(cap_by_notional),
+                        "rounded_down": bool(rounded_down),
+                        "sz_decimals": int(decimals),
+                        "follower_pos": float(pos_size),
+                    }
+                logger.info(
+                    "EXEC CLOSE: coin=%s action=%s leader_size=%s copy_ratio=%s copy_size=%s follower_pos=%s",
+                    coin,
+                    trade.action,
+                    float(getattr(trade, 'size', 0) or 0),
+                    float(copy_ratio),
+                    float(copy_size),
+                    float(position.size),
+                )
+                closed = await self._market_close_partial(coin, copy_size)
+                self.schedule_refresh(delay_s=1.0)
+                return {
+                    "status": "submitted",
+                    "reason": None,
+                    "coin": coin,
+                    "action": str(trade.action),
+                    "requested_size": float(requested_size),
+                    "order_size": float(closed or 0.0),
+                    "max_size": float(max_size),
+                    "max_notional_per_trade_usd": float(max_notional),
+                    "min_trade_size": float(min_sz),
+                    "capped_by_size": bool(cap_by_size),
+                    "capped_by_notional": bool(cap_by_notional),
+                    "rounded_down": bool(rounded_down),
+                    "sz_decimals": int(decimals),
+                    "follower_pos": float(position.size),
+                }
 
             side = getattr(trade, 'side', None)
             if side in ("B", "A"):
@@ -167,39 +437,330 @@ class PositionManager:
             leverage = int(getattr(trade, 'leverage', 1) or 1)
             leverage = max(1, min(leverage, int(max_leverage)))
 
+            async def _wait_no_opposite_position(*, want_buy: bool, decimals_for_eps: int) -> bool:
+                if not self._flip_wait_for_close:
+                    return True
+                timeout_s = max(0.0, float(self._flip_wait_timeout_s))
+                if timeout_s <= 0:
+                    return True
+                poll_s = max(0.25, float(self._flip_wait_poll_s))
+                eps = max(1e-12, 10 ** (-max(0, int(decimals_for_eps))))
+
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    # Force update and ignore backoff to ensure we get fresh position data
+                    await self.update_positions(force=True, ignore_backoff=True)
+                    pos_now = self.get_position(coin)
+                    size_now = float(pos_now.size) if pos_now else 0.0
+
+                    # want_buy=True means we're going to open long, so we must not still be short.
+                    if want_buy:
+                        if size_now >= -eps:
+                            return True
+                    else:
+                        if size_now <= eps:
+                            return True
+
+                    await asyncio.sleep(poll_s)
+                return False
+
             if is_buy and position and position.is_short:
-                await self._market_close_partial(coin, copy_size)
+                # Flip support: close short first, then open long for the remaining size.
+                close_req = min(float(copy_size), abs(float(position.size)))
+                closed = await self._market_close_partial(coin, close_req)
+                remaining = max(0.0, float(copy_size) - float(closed or 0.0))
+                opened = 0.0
+                # Only attempt to open remainder if we intended to fully close the opposite position.
+                full_close_intended = abs(float(position.size)) <= (float(close_req) + max(1e-12, 10 ** (-max(0, int(decimals)))))
+                if remaining >= min_sz and full_close_intended:
+                    ok = await _wait_no_opposite_position(want_buy=True, decimals_for_eps=int(decimals))
+                    if (not ok) and (not self._flip_open_on_timeout):
+                        self.schedule_refresh(delay_s=1.0)
+                        return {
+                            "status": "submitted",
+                            "reason": "flip_wait_timeout",
+                            "coin": coin,
+                            "action": str(trade.action),
+                            "requested_size": float(requested_size),
+                            "order_size": float(copy_size),
+                            "closed_size": float(closed or 0.0),
+                            "opened_size": 0.0,
+                            "max_size": float(max_size),
+                            "max_notional_per_trade_usd": float(max_notional),
+                            "min_trade_size": float(min_sz),
+                            "capped_by_size": bool(cap_by_size),
+                            "capped_by_notional": bool(cap_by_notional),
+                            "rounded_down": bool(rounded_down),
+                            "sz_decimals": int(decimals),
+                            "follower_pos": float(position.size),
+                        }
+
+                    await self._set_leverage(coin, leverage)
+                    await self._market_open(coin, True, remaining)
+                    opened = float(remaining)
+                self.schedule_refresh(delay_s=1.0)
+                return {
+                    "status": "submitted",
+                    "reason": "flip" if opened > 0 else "close_only",
+                    "coin": coin,
+                    "action": str(trade.action),
+                    "requested_size": float(requested_size),
+                    # Keep backward compatibility: order_size reflects the intended total.
+                    "order_size": float(copy_size),
+                    "closed_size": float(closed or 0.0),
+                    "opened_size": float(opened or 0.0),
+                    "max_size": float(max_size),
+                    "max_notional_per_trade_usd": float(max_notional),
+                    "min_trade_size": float(min_sz),
+                    "capped_by_size": bool(cap_by_size),
+                    "capped_by_notional": bool(cap_by_notional),
+                    "rounded_down": bool(rounded_down),
+                    "sz_decimals": int(decimals),
+                    "follower_pos": float(position.size),
+                }
             elif (not is_buy) and position and position.is_long:
-                await self._market_close_partial(coin, copy_size)
+                # Flip support: close long first, then open short for the remaining size.
+                close_req = min(float(copy_size), abs(float(position.size)))
+                closed = await self._market_close_partial(coin, close_req)
+                remaining = max(0.0, float(copy_size) - float(closed or 0.0))
+                opened = 0.0
+                full_close_intended = abs(float(position.size)) <= (float(close_req) + max(1e-12, 10 ** (-max(0, int(decimals)))))
+                if remaining >= min_sz and full_close_intended:
+                    ok = await _wait_no_opposite_position(want_buy=False, decimals_for_eps=int(decimals))
+                    if (not ok) and (not self._flip_open_on_timeout):
+                        self.schedule_refresh(delay_s=1.0)
+                        return {
+                            "status": "submitted",
+                            "reason": "flip_wait_timeout",
+                            "coin": coin,
+                            "action": str(trade.action),
+                            "requested_size": float(requested_size),
+                            "order_size": float(copy_size),
+                            "closed_size": float(closed or 0.0),
+                            "opened_size": 0.0,
+                            "max_size": float(max_size),
+                            "max_notional_per_trade_usd": float(max_notional),
+                            "min_trade_size": float(min_sz),
+                            "capped_by_size": bool(cap_by_size),
+                            "capped_by_notional": bool(cap_by_notional),
+                            "rounded_down": bool(rounded_down),
+                            "sz_decimals": int(decimals),
+                            "follower_pos": float(position.size),
+                        }
+
+                    await self._set_leverage(coin, leverage)
+                    await self._market_open(coin, False, remaining)
+                    opened = float(remaining)
+                self.schedule_refresh(delay_s=1.0)
+                return {
+                    "status": "submitted",
+                    "reason": "flip" if opened > 0 else "close_only",
+                    "coin": coin,
+                    "action": str(trade.action),
+                    "requested_size": float(requested_size),
+                    "order_size": float(copy_size),
+                    "closed_size": float(closed or 0.0),
+                    "opened_size": float(opened or 0.0),
+                    "max_size": float(max_size),
+                    "max_notional_per_trade_usd": float(max_notional),
+                    "min_trade_size": float(min_sz),
+                    "capped_by_size": bool(cap_by_size),
+                    "capped_by_notional": bool(cap_by_notional),
+                    "rounded_down": bool(rounded_down),
+                    "sz_decimals": int(decimals),
+                    "follower_pos": float(position.size),
+                }
             else:
                 await self._set_leverage(coin, leverage)
                 await self._market_open(coin, is_buy, copy_size)
 
-            # Refresh positions lazily to avoid user_state bursts (and 429).
-            self.schedule_refresh(delay_s=1.0)
+                # Refresh positions lazily to avoid user_state bursts (and 429).
+                self.schedule_refresh(delay_s=1.0)
+                return {
+                    "status": "submitted",
+                    "reason": None,
+                    "coin": coin,
+                    "action": str(trade.action),
+                    "requested_size": float(requested_size),
+                    "order_size": float(copy_size),
+                    "max_size": float(max_size),
+                    "max_notional_per_trade_usd": float(max_notional),
+                    "min_trade_size": float(min_sz),
+                    "capped_by_size": bool(cap_by_size),
+                    "capped_by_notional": bool(cap_by_notional),
+                    "rounded_down": bool(rounded_down),
+                    "sz_decimals": int(decimals),
+                }
 
         except Exception as e:
             logger.error(f"Error executing copy trade: {e}")
+            return {
+                "status": "error",
+                "reason": str(e),
+                "coin": getattr(trade, 'coin', ''),
+                "action": str(getattr(trade, 'action', '')),
+                "requested_size": float(getattr(trade, 'size', 0) or 0) * float(copy_ratio),
+                "order_size": 0.0,
+                "max_size": float(max_size),
+                "max_notional_per_trade_usd": float(max_notional_per_trade_usd or 0.0),
+            }
+
+    async def _refresh_sz_decimals_cache(self) -> None:
+        """Refresh szDecimals cache from meta API.
+
+        Extracted as separate method to enable both preheating and on-demand refresh.
+        """
+        try:
+            meta = await asyncio.to_thread(self.info.meta)
+            universe = meta.get('universe', []) if isinstance(meta, dict) else []
+            mapping: Dict[str, int] = {}
+            for a in universe:
+                name = a.get('name')
+                if not name:
+                    continue
+                try:
+                    # NOTE: Do NOT use "or 3" here - it breaks coins with szDecimals=0 (e.g., ANIME)
+                    # because 0 is falsy in Python, so "0 or 3" evaluates to 3.
+                    sz_dec_raw = a.get('szDecimals', 3)
+                    sz_dec = int(sz_dec_raw) if sz_dec_raw is not None else 3
+                    mapping[str(name)] = sz_dec
+                except Exception:
+                    mapping[str(name)] = 3
+            if mapping:
+                self._sz_decimals_by_coin = mapping
+                self._sz_decimals_fetched_at = time.monotonic()
+                logger.debug(f"szDecimals cache refreshed: {len(mapping)} coins")
+            else:
+                logger.warning("szDecimals refresh returned empty mapping")
+        except Exception as e:
+            # Keep old cache on failure
+            logger.warning(f"Failed to refresh szDecimals cache: {e}")
+
+    async def _get_sz_decimals(self, coin: str) -> int:
+        """Get allowed size decimals for a coin (szDecimals).
+
+        Uses cached meta universe to avoid frequent REST calls.
+        Defaults to 3 if unavailable.
+        """
+        coin = str(coin or '')
+        if not coin:
+            logger.debug("_get_sz_decimals called with empty coin, returning default 3")
+            return 3
+
+        now = time.monotonic()
+
+        # Refresh on TTL expiry.
+        if (now - self._sz_decimals_fetched_at) > self._sz_decimals_ttl_s:
+            logger.debug(f"szDecimals cache TTL expired, refreshing...")
+            await self._refresh_sz_decimals_cache()
+
+        # If coin is missing, refresh opportunistically (new listings) but throttle.
+        if coin not in self._sz_decimals_by_coin:
+            # Log cache inspection for debugging
+            logger.info(f"🔍 szDecimals cache MISS for '{coin}' (type={type(coin).__name__}, len={len(coin)}, repr={repr(coin)})")
+            logger.info(f"   Cache has {len(self._sz_decimals_by_coin)} entries. Sample keys: {list(self._sz_decimals_by_coin.keys())[:10]}")
+            # Check for case-insensitive or whitespace variants
+            similar_keys = [k for k in self._sz_decimals_by_coin.keys() if coin.strip().upper() == k.strip().upper()]
+            if similar_keys:
+                logger.warning(f"   Found similar keys (case/whitespace differ): {similar_keys}")
+
+            if (now - self._sz_decimals_miss_refresh_at) > self._sz_decimals_miss_refresh_cooldown_s:
+                logger.info(f"   Refreshing cache for potential new listing...")
+                self._sz_decimals_miss_refresh_at = now
+                await self._refresh_sz_decimals_cache()
+
+        if coin in self._sz_decimals_by_coin:
+            decimals = int(self._sz_decimals_by_coin[coin])
+            logger.info(f"✅ szDecimals for '{coin}': {decimals}")
+            return decimals
+
+        logger.warning(f"❌ szDecimals not found for '{coin}', using default 3")
+        return 3
+
+    def _extract_order_error(self, result: Any) -> Optional[str]:
+        """Extract an order error from common Hyperliquid SDK response shapes."""
+        if not isinstance(result, dict):
+            return None
+
+        # Some responses may include a top-level error.
+        for key in ("error", "err", "message"):
+            try:
+                v = result.get(key)
+                if v:
+                    return str(v)
+            except Exception:
+                pass
+
+        try:
+            resp = result.get("response")
+            if isinstance(resp, dict):
+                data = resp.get("data")
+                if isinstance(data, dict):
+                    statuses = data.get("statuses")
+                    if isinstance(statuses, list):
+                        errors = []
+                        for s in statuses:
+                            if isinstance(s, dict) and s.get("error"):
+                                errors.append(str(s.get("error")))
+                        if errors:
+                            return "; ".join(errors)
+        except Exception:
+            pass
+
+        return None
+
+    def _round_down(self, size: float, decimals: int) -> float:
+        try:
+            decimals = int(decimals)
+        except Exception:
+            decimals = 3
+        decimals = max(0, min(8, decimals))
+        if size <= 0:
+            return 0.0
+        factor = 10 ** decimals
+        return math.floor(float(size) * factor) / factor
 
     async def _market_open(self, coin: str, is_buy: bool, size: float):
         try:
+            logger.info(f"📤 _market_open called: coin='{coin}' (type={type(coin).__name__}, repr={repr(coin)}) is_buy={is_buy} size={size}")
+            decimals = await self._get_sz_decimals(coin)
+            size_before_round = float(size)
+            size = self._round_down(size_before_round, decimals)
+            if size <= 0:
+                logger.info(f"Market open skipped (rounded size=0): {coin}")
+                return
+            logger.info(f"Market open: {coin} {'BUY' if is_buy else 'SELL'} size={size} (before_round={size_before_round:.6f}, szDecimals={decimals})")
             result = await asyncio.to_thread(self.exchange.market_open, coin, is_buy, size)
-            logger.info(f"Market open: {coin} {'BUY' if is_buy else 'SELL'} {size}, result: {result}")
+            logger.info(f"Market open result: {coin} {size} -> {result}")
+            err = self._extract_order_error(result)
+            if err:
+                raise RuntimeError(f"market_open rejected: {err}")
         except Exception as e:
             logger.error(f"Error market_open {coin}: {e}")
+            raise
 
-    async def _market_close_partial(self, coin: str, size: float):
+    async def _market_close_partial(self, coin: str, size: float) -> float:
         try:
             position = self.get_position(coin)
             if not position or position.size == 0:
                 logger.warning(f"No position to close for {coin}")
-                return
+                return 0.0
 
-            close_size = min(size, abs(position.size))
+            decimals = await self._get_sz_decimals(coin)
+            close_size = min(float(size), abs(float(position.size)))
+            close_size = self._round_down(close_size, decimals)
+            if close_size <= 0:
+                logger.info(f"Market close skipped (rounded size=0): {coin}")
+                return 0.0
             result = await asyncio.to_thread(self.exchange.market_close, coin, close_size)
             logger.info(f"Market close: {coin} {close_size}, result: {result}")
+            err = self._extract_order_error(result)
+            if err:
+                raise RuntimeError(f"market_close rejected: {err}")
+            return float(close_size)
         except Exception as e:
             logger.error(f"Error market_close {coin}: {e}")
+            raise
 
     async def _set_leverage(self, coin: str, leverage: int):
         """设置杠杆。"""

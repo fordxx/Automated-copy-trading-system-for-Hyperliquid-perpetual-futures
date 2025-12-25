@@ -44,6 +44,17 @@ nano .env
 - `COPY_RATIO`: 跟单比例（0.1 = 10%）
 - `TELEGRAM_BOT_TOKEN`: Telegram机器人令牌（可选）
 
+**常用可选环境变量（建议了解）：**
+- `MAX_POSITION_SIZE`: 单币种最大跟单仓位（合约数量上限）
+- `MAX_NOTIONAL_PER_TRADE_USD`: 单笔跟单名义金额上限（USD）；>0 时会在 `COPY_RATIO` 之后再次截断
+- `MIN_TRADE_SIZE`: 小于该数量的订单会被跳过（默认 0.01）
+- `TRADE_BATCH_WINDOW_MS`: 交易批处理窗口（毫秒），降低 429 / 降噪
+- `WEBSOCKET_IDLE_TIMEOUT_S`: WebSocket 空闲超时（秒），超时自动重连
+- `WEBSOCKET_IDLE_LOG_INTERVAL_S`: WebSocket idle 重连告警日志节流（秒）
+- `IGNORE_SIGINT_WHEN_DETACHED`: 后台运行时忽略 SIGINT（默认 true，避免 Ctrl+C / stray SIGINT 误停）
+- `FLIP_WAIT_FOR_CLOSE`: 翻仓更稳模式（默认 true：先平再开，等待对侧仓位消失）
+- `FLIP_WAIT_TIMEOUT_S`/`FLIP_WAIT_POLL_S`/`FLIP_OPEN_ON_TIMEOUT`: 翻仓等待细节
+
 ### 方式二：YAML配置文件
 
 复制 `config/config.yaml` 并修改配置：
@@ -75,12 +86,29 @@ hyperliquid:
 最省事的方式：
 
 ```bash
-cd new_project
+cd /home/fordxx/perp-tools/copybot
 chmod +x scripts/manage_copy_trader.sh
 ./scripts/manage_copy_trader.sh
 ```
 
 菜单里可以：启动/停止/重启、看进程、看日志。
+
+### 命令行运维（不进菜单）
+
+```bash
+./scripts/manage_copy_trader.sh status
+./scripts/manage_copy_trader.sh start
+./scripts/manage_copy_trader.sh stop
+./scripts/manage_copy_trader.sh restart
+
+# 实时日志（按 Ctrl+C 退出查看，不会停服务）
+./scripts/manage_copy_trader.sh tail app
+./scripts/manage_copy_trader.sh tail stdout
+
+# 最近 N 行
+./scripts/manage_copy_trader.sh last 200 app
+./scripts/manage_copy_trader.sh last 200 stdout
+```
 
 ### 使用环境变量：
 ```bash
@@ -123,7 +151,12 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
 
-## 安全注意事项
+备注：通知消息使用 Markdown 格式。若 Telegram 返回 `can't parse entities`，可以先临时设置 `TELEGRAM_ENABLED=false`（不中断交易），再排查消息格式/转义问题。
+
+## 交易执行与精度说明
+
+- 程序会解析交易所返回结构中的 `statuses[].error`：有 error 会记为失败并输出 `Trade failed(...)`，避免“提示成功但实际拒单”。
+- 部分币种合约数量只能是整数（例如 `szDecimals=0`）。程序会按 `szDecimals` 向下取整后再下单；如果日志仍出现 `Order has invalid size.`，优先检查该币种 `szDecimals` 是否正确缓存/刷新。
 
 ## 安全注意事项
 

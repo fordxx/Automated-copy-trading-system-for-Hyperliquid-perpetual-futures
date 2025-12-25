@@ -1,8 +1,42 @@
 """Helper utilities for Hyperliquid Copy Trader."""
 import logging
 import os
+import re
 from typing import Dict, Any
 import yaml
+
+
+class SecretRedactingFilter(logging.Filter):
+    """Redacts common secret patterns from log messages."""
+
+    _re_private_key = re.compile(r"0x[a-fA-F0-9]{64}")
+    _re_tg_token = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
+    _re_env_assignments = re.compile(
+        r"\b(HYPERLIQUID_PRIVATE_KEY|TELEGRAM_BOT_TOKEN)=[^\s]+",
+        re.IGNORECASE,
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            # Get the formatted message (after args interpolation)
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        sanitized = msg
+        sanitized = self._re_private_key.sub("0x***REDACTED***", sanitized)
+        sanitized = self._re_tg_token.sub("***REDACTED_TG_TOKEN***", sanitized)
+        sanitized = self._re_env_assignments.sub(lambda m: f"{m.group(1)}=***REDACTED***", sanitized)
+
+        if sanitized != msg:
+            # Replace the message with sanitized version and clear args
+            # to prevent double formatting
+            record.msg = sanitized
+            record.args = ()
+            # Also sanitize the raw msg in case it's used elsewhere
+            if hasattr(record, '_original_msg'):
+                record._original_msg = sanitized
+        return True
 
 
 def setup_logging(config: Dict[str, Any]):
@@ -27,6 +61,13 @@ def setup_logging(config: Dict[str, Any]):
             logging.StreamHandler()
         ]
     )
+
+    # Redact secrets from any accidental log output.
+    redactor = SecretRedactingFilter()
+    root_logger = logging.getLogger()
+    root_logger.addFilter(redactor)
+    for handler in root_logger.handlers:
+        handler.addFilter(redactor)
 
     # 设置第三方库日志级别
     logging.getLogger('hyperliquid').setLevel(logging.WARNING)

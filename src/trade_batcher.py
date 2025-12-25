@@ -25,12 +25,14 @@ class TradeBatcher:
         *,
         window_s: float = 0.5,
         on_batch: Callable[[List[MonitoredTrade]], Awaitable[None]],
+        max_queue_size: int = 10000,
     ):
         self._window_s = float(window_s)
         self._on_batch = on_batch
 
-        self._queue: asyncio.Queue[MonitoredTrade] = asyncio.Queue()
+        self._queue: asyncio.Queue[MonitoredTrade] = asyncio.Queue(maxsize=max_queue_size)
         self._worker_task: Optional[asyncio.Task] = None
+        self._worker_lock = asyncio.Lock()
         self._closed = False
 
         self._stats: Dict[str, object] = {
@@ -57,8 +59,16 @@ class TradeBatcher:
             self._stats["dropped"] = int(self._stats["dropped"]) + 1
             return
 
+        # Ensure only one worker task is created using a lock
         if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._worker())
+            # Create a task to acquire the lock and start worker if needed
+            asyncio.create_task(self._ensure_worker_running())
+
+    async def _ensure_worker_running(self) -> None:
+        """Ensure only one worker task is running at a time."""
+        async with self._worker_lock:
+            if self._worker_task is None or self._worker_task.done():
+                self._worker_task = asyncio.create_task(self._worker())
 
     async def close(self) -> None:
         self._closed = True
@@ -98,52 +108,72 @@ class TradeBatcher:
                 await self._on_batch(aggregated)
 
     def _aggregate(self, trades: List[MonitoredTrade]) -> List[MonitoredTrade]:
-        per_coin: Dict[str, Dict[str, object]] = {}
+        # IMPORTANT: do not net OPEN and CLOSE semantics together.
+        # If the leader is closing (clearing) but the follower has no position,
+        # an accidental OPEN would be dangerous. We therefore aggregate per
+        # (coin, action) and preserve action on emission.
+        per_key: Dict[tuple[str, str], Dict[str, object]] = {}
 
         for t in trades:
             coin = t.coin
-            side = getattr(t, "side", None)
-            if side not in ("B", "A"):
-                # Fallback to action
-                side = "B" if t.action == TradeAction.OPEN_LONG else "A"
+            action = str(getattr(t, "action", "") or "")
+            if action not in (
+                TradeAction.OPEN_LONG,
+                TradeAction.OPEN_SHORT,
+                TradeAction.CLOSE_LONG,
+                TradeAction.CLOSE_SHORT,
+            ):
+                # Fallback: infer opens from side
+                side = getattr(t, "side", None)
+                if side == "B":
+                    action = TradeAction.OPEN_LONG
+                elif side == "A":
+                    action = TradeAction.OPEN_SHORT
+                else:
+                    # If we can't infer, drop it from aggregation.
+                    continue
 
-            signed = float(t.size) if side == "B" else -float(t.size)
-
-            entry = per_coin.get(coin)
+            key = (coin, action)
+            entry = per_key.get(key)
             if entry is None:
-                per_coin[coin] = {
-                    "net": signed,
+                per_key[key] = {
+                    "sum_size": float(t.size),
                     "last": t,
                     "max_leverage": int(getattr(t, "leverage", 1) or 1),
                 }
             else:
-                entry["net"] = float(entry["net"]) + signed
+                entry["sum_size"] = float(entry["sum_size"]) + float(t.size)
                 entry["last"] = t
                 entry["max_leverage"] = max(int(entry["max_leverage"]), int(getattr(t, "leverage", 1) or 1))
 
         now_ms = int(time.time() * 1000)
         out: List[MonitoredTrade] = []
 
-        for coin, entry in per_coin.items():
-            net = float(entry["net"])
-            if abs(net) <= 0:
+        for (coin, action), entry in per_key.items():
+            total_size = float(entry["sum_size"])
+            if total_size <= 0:
                 continue
 
-            side = "B" if net > 0 else "A"
-            action = TradeAction.OPEN_LONG if side == "B" else TradeAction.OPEN_SHORT
+            # Preserve side semantics for downstream execution.
+            if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT):
+                side = "B"
+            else:
+                side = "A"
 
             last: MonitoredTrade = entry["last"]  # type: ignore[assignment]
             leverage = int(entry["max_leverage"])
+            direction = "long" if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG) else "short"
 
             out.append(
                 MonitoredTrade(
                     action=action,
                     coin=coin,
-                    size=abs(net),
+                    size=total_size,
                     price=float(getattr(last, "price", 0) or 0),
                     leverage=leverage,
                     timestamp=now_ms,
-                    tx_hash=f"batch:{now_ms}:{coin}:{side}",
+                    tx_hash=f"batch:{now_ms}:{coin}:{action}",
+                    direction=direction,
                     side=side,
                 )
             )

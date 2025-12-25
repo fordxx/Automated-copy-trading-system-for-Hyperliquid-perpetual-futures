@@ -35,6 +35,31 @@ EXCLUDE_ADDRESSES=0x你的钱包地址
 # 跟单比例 (0.1 = 10%)
 COPY_RATIO=0.1
 
+# 单币种最大仓位上限（合约数量）
+MAX_POSITION_SIZE=1.0
+
+# 单笔跟单名义金额上限（USD），>0 时会在 COPY_RATIO 之后再次截断
+MAX_NOTIONAL_PER_TRADE_USD=0
+
+# 小于该数量的订单会跳过（默认 0.01）
+MIN_TRADE_SIZE=0.01
+
+# 批处理窗口（ms）：目标地址短时间内多笔成交会被聚合，降低 429
+TRADE_BATCH_WINDOW_MS=300
+
+# WebSocket 空闲重连：目标地址长期没成交时可调大减少“idle 重连”刷屏
+WEBSOCKET_IDLE_TIMEOUT_S=30
+WEBSOCKET_IDLE_LOG_INTERVAL_S=300
+
+# 后台运行时忽略 SIGINT，避免 Ctrl+C / stray SIGINT 误停（默认 true）
+IGNORE_SIGINT_WHEN_DETACHED=true
+
+# 翻仓更稳模式：先平再开（默认 true）
+FLIP_WAIT_FOR_CLOSE=true
+FLIP_WAIT_TIMEOUT_S=6
+FLIP_WAIT_POLL_S=0.75
+FLIP_OPEN_ON_TIMEOUT=false
+
 # Telegram通知 (可选)
 TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=从BotFather获取的令牌
@@ -49,6 +74,34 @@ TELEGRAM_CHAT_ID=你的Telegram用户ID
 ### 5. 启动交易器
 ```bash
 python scripts/run_copy_trader.py --env
+```
+
+更推荐用管理脚本后台运行（更省事，也更不容易误停）：
+
+```bash
+chmod +x scripts/manage_copy_trader.sh
+./scripts/manage_copy_trader.sh start
+./scripts/manage_copy_trader.sh status
+
+# 实时日志（按 Ctrl+C 退出查看，不会停服务）
+./scripts/manage_copy_trader.sh tail app
+./scripts/manage_copy_trader.sh tail stdout
+```
+
+## 📉 风险阈值语义（重要）
+
+- `MAX_DRAWDOWN` / `STOP_LOSS_RATIO` 的默认语义是“比例”：例如 `0.1` 表示账户权益的 10%。
+- 为兼容老配置：如果设置值 `> 1`，程序会把它当作“绝对美元阈值”。
+
+示例：
+
+```bash
+# 回撤 10%，止损 5%
+MAX_DRAWDOWN=0.10
+STOP_LOSS_RATIO=0.05
+
+# 或者：直接按美元止损（绝对值）
+STOP_LOSS_RATIO=50
 ```
 
 ## 🔑 如何获取所需信息

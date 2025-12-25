@@ -17,15 +17,38 @@
 ### 1. 环境准备
 
 ```bash
-# 克隆或下载项目到 new_project 目录
-cd new_project
+# 进入项目目录
+cd /home/fordxx/perp-tools/copybot
 
 # 运行设置脚本
 chmod +x scripts/setup.sh
 ./scripts/setup.sh
 ```
 
-### 2. 配置设置
+### 2. 配置设置（推荐：使用 .env）
+
+相比直接改 YAML，使用 `.env` 更适合后台运行（并且程序会显式从仓库根目录加载 `.env`）。
+
+```bash
+cp .env.template .env
+nano .env
+
+./scripts/validate_env.sh
+```
+
+最关键的几项：
+
+```bash
+TARGET_ADDRESS=0x...
+HYPERLIQUID_ACCOUNT_ADDRESS=0x...
+HYPERLIQUID_PRIVATE_KEY=0x...
+HYPERLIQUID_ENV=mainnet
+
+# 跟单比例（示例：0.2=20%）
+COPY_RATIO=0.2
+```
+
+### 2.2 也可以使用 YAML（可选）
 
 ```bash
 # 复制配置文件
@@ -118,7 +141,7 @@ nano .env
 
 ```bash
 # 激活虚拟环境
-source venv/bin/activate
+source .venv/bin/activate
 
 # 可选: 测试Telegram通知
 python scripts/test_telegram.py YOUR_BOT_TOKEN YOUR_CHAT_ID
@@ -132,12 +155,22 @@ python scripts/run_copy_trader.py
 如果你不想记命令，直接使用菜单脚本：
 
 ```bash
-cd new_project
+cd /home/fordxx/perp-tools/copybot
 chmod +x scripts/manage_copy_trader.sh
 ./scripts/manage_copy_trader.sh
 ```
 
 菜单里可以：一键启动/停止/重启、查看进程状态、实时看日志。
+
+也可以不进菜单直接用子命令：
+
+```bash
+./scripts/manage_copy_trader.sh status
+./scripts/manage_copy_trader.sh restart
+
+./scripts/manage_copy_trader.sh tail app
+./scripts/manage_copy_trader.sh tail stdout
+```
 
 ## 安全提醒
 
@@ -171,8 +204,11 @@ src/
 ### 日志查看
 
 ```bash
-# 查看实时日志
-tail -f logs/copy_trader.log
+# 查看实时日志（推荐）
+./scripts/manage_copy_trader.sh tail app
+
+# 或直接 tail 文件
+tail -n 50 -f logs/copy_trader.log
 
 # 查看错误日志
 grep ERROR logs/copy_trader.log

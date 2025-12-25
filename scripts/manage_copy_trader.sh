@@ -27,7 +27,9 @@ require_venv() {
 }
 
 running_pids() {
-  pgrep -af "scripts/run_copy_trader.py" | awk '{print $1}' || true
+  # Scope to this workspace's runner path to avoid killing other copies of the bot
+  # that happen to live elsewhere on the same machine.
+  pgrep -af -- "$RUNNER" | awk '{print $1}' || true
 }
 
 is_running() {
@@ -107,16 +109,16 @@ stop_service() {
 
   echo "准备停止 PID: $pids"
 
-  # 优先用 PID 文件优雅退出（SIGINT）；若 PID 文件缺失则对所有匹配进程发 SIGINT
+  # 优先用 PID 文件优雅退出（SIGTERM）；若 PID 文件缺失则对所有匹配进程发 SIGTERM
   if [[ -f "$PID_FILE" ]]; then
     local pid
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
     if [[ -n "$pid" ]]; then
-      kill -INT "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
     fi
   else
     for pid in $pids; do
-      kill -INT "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
     done
   fi
 
@@ -125,7 +127,7 @@ stop_service() {
   # 如果还存在，强制杀掉（避免重复下单风险）
   if is_running; then
     echo "⚠️ 仍有残留进程，执行强制停止..."
-    pkill -9 -f "scripts/run_copy_trader.py" || true
+    pkill -9 -f -- "$RUNNER" || true
     sleep 0.5
   fi
 
@@ -213,5 +215,43 @@ menu() {
     esac
   done
 }
+
+if [[ $# -gt 0 ]]; then
+  cmd="$1"
+  shift || true
+  case "$cmd" in
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) restart_service ;;
+    status) status ;;
+    tail)
+      # Non-interactive tail: default to app log; pass "stdout" to follow service stdout.
+      which_log="${1:-app}"
+      if [[ "$which_log" == "stdout" ]]; then
+        tail -f "$LOG_STDOUT"
+      else
+        tail -f "$LOG_APP"
+      fi
+      ;;
+    last)
+      # Non-interactive last: show last N lines; default 200.
+      n="${1:-200}"
+      which_log="${2:-app}"
+      if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+        n=200
+      fi
+      if [[ "$which_log" == "stdout" ]]; then
+        tail -n "$n" "$LOG_STDOUT" || true
+      else
+        tail -n "$n" "$LOG_APP" || true
+      fi
+      ;;
+    *)
+      echo "Usage: $0 {start|stop|restart|status|tail [app|stdout]|last [N] [app|stdout]}"
+      exit 2
+      ;;
+  esac
+  exit $?
+fi
 
 menu

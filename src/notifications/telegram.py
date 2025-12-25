@@ -32,21 +32,36 @@ class TelegramNotifier:
 
     async def initialize(self):
         """初始化HTTP会话。"""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+        if not self.session or self.session.closed:
+            # Close old session if it exists but is closed
+            if self.session and self.session.closed:
+                try:
+                    await self.session.close()
+                except Exception:
+                    pass
+            try:
+                self.session = aiohttp.ClientSession()
+            except Exception as e:
+                logger.error(f"Failed to create aiohttp session: {e}")
+                self.session = None
+                raise
 
     async def close(self):
         """关闭HTTP会话。"""
         if self.session:
-            await self.session.close()
-            self.session = None
+            try:
+                await self.session.close()
+            except Exception as e:
+                logger.debug(f"Error closing session: {e}")
+            finally:
+                self.session = None
 
-    async def send_message(self, message: str, parse_mode: str = "Markdown") -> bool:
+    async def send_message(self, message: str, parse_mode: Optional[str] = None) -> bool:
         """发送消息到Telegram。
 
         Args:
             message: 消息内容
-            parse_mode: 解析模式 (Markdown, HTML等)
+            parse_mode: 解析模式 (None for plain text, "Markdown", "HTML", etc.)
 
         Returns:
             发送是否成功
@@ -59,9 +74,10 @@ class TelegramNotifier:
             data = {
                 "chat_id": self.chat_id,
                 "text": message,
-                "parse_mode": parse_mode,
                 "disable_web_page_preview": True
             }
+            if parse_mode:
+                data["parse_mode"] = parse_mode
 
             async with self.session.post(url, json=data) as response:
                 if response.status == 200:
@@ -123,8 +139,17 @@ class TelegramNotifier:
             action = trade_data.get('action', 'unknown')
             coin = trade_data.get('coin', 'unknown')
             size = trade_data.get('size', 0)
+            requested_size = trade_data.get('requested_size')
             price = trade_data.get('price', 0)
             pnl = trade_data.get('pnl', 0)
+            status = trade_data.get('status')
+            reason = trade_data.get('reason')
+            capped_by_notional = trade_data.get('capped_by_notional')
+            capped_by_size = trade_data.get('capped_by_size')
+            max_notional_per_trade_usd = trade_data.get('max_notional_per_trade_usd')
+            rounded_down = trade_data.get('rounded_down')
+            sz_decimals = trade_data.get('sz_decimals')
+            min_trade_size = trade_data.get('min_trade_size')
 
             # 构建消息
             emoji = "🟢" if action in ['open_long', 'close_short'] else "🔴"
@@ -135,11 +160,68 @@ class TelegramNotifier:
                 'close_short': '平空'
             }.get(action, action.upper())
 
-            message = f"{emoji} **交易通知**\n\n"
+            message = f"{emoji} 交易通知\n\n"
             message += f"📊 操作: {action_text}\n"
             message += f"🪙 币种: {coin}\n"
-            message += f"📈 数量: {size:.4f}\n"
+            # If we have both requested and actual, show both to avoid confusion.
+            try:
+                size_f = float(size)
+            except Exception:
+                size_f = 0.0
+
+            if requested_size is not None:
+                try:
+                    req_f = float(requested_size)
+                except Exception:
+                    req_f = None
+                if req_f is not None:
+                    message += f"📈 计划数量: {req_f:.4f}\n"
+                    message += f"✅ 实际数量: {size_f:.4f}\n"
+                else:
+                    message += f"📈 数量: {size_f:.4f}\n"
+            else:
+                message += f"📈 数量: {size_f:.4f}\n"
+
+            # Explain why actual size differs from planned size.
+            cap_notes: list[str] = []
+            try:
+                if capped_by_notional is True and max_notional_per_trade_usd is not None:
+                    cap_notes.append(f"已按名义上限 ${float(max_notional_per_trade_usd):.0f} 截断")
+            except Exception:
+                if capped_by_notional is True:
+                    cap_notes.append("已按名义上限截断")
+            if capped_by_size is True:
+                cap_notes.append("已按合约数量上限截断")
+            if rounded_down is True:
+                if sz_decimals is not None:
+                    cap_notes.append(f"已按精度向下取整 (szDecimals={int(sz_decimals)})")
+                else:
+                    cap_notes.append("已按精度向下取整")
+            if cap_notes:
+                message += f"✂️ 调整: {'；'.join(cap_notes)}\n"
+
             message += f"💰 价格: ${price:.2f}\n"
+
+            if status:
+                status_text = {
+                    'submitted': '已提交',
+                    'executed': '已执行',
+                    'skipped': '已跳过',
+                    'error': '失败',
+                }.get(str(status), str(status))
+                message += f"🧾 结果: {status_text}\n"
+                if reason:
+                    reason_text = {
+                        'no_follower_position': '跟单账户无对应仓位，无法平仓',
+                        'too_small': '数量过小',
+                    }.get(str(reason), str(reason))
+                    message += f"📝 原因: {reason_text}\n"
+
+                    if str(reason) == 'too_small' and min_trade_size is not None:
+                        try:
+                            message += f"🔎 阈值: MIN_TRADE_SIZE={float(min_trade_size):g}\n"
+                        except Exception:
+                            message += f"🔎 阈值: MIN_TRADE_SIZE={min_trade_size}\n"
 
             if pnl != 0:
                 pnl_emoji = "📈" if pnl > 0 else "📉"
@@ -160,7 +242,7 @@ class TelegramNotifier:
             total_positions = status_data.get('total_positions', 0)
             total_pnl = status_data.get('total_pnl', 0)
 
-            message = f"📊 **状态报告**\n\n"
+            message = f"📊 状态报告\n\n"
             message += f"📂 持仓数量: {total_positions}\n"
             message += f"💰 总盈亏: ${total_pnl:.2f}\n"
 
@@ -192,7 +274,7 @@ class TelegramNotifier:
             }
 
             emoji = emoji_map.get(alert_type.lower(), '🔔')
-            full_message = f"{emoji} **{alert_type.upper()}**\n\n{message}"
+            full_message = f"{emoji} {alert_type.upper()}\n\n{message}"
 
             await self.send_message(full_message)
 
@@ -201,13 +283,13 @@ class TelegramNotifier:
 
     async def send_startup_notification(self):
         """发送启动通知。"""
-        message = "🚀 **Hyperliquid Copy Trader 已启动**\n\n"
+        message = "🚀 Hyperliquid Copy Trader 已启动\n\n"
         message += "系统正在监控目标地址的交易活动..."
         await self.send_message(message)
 
     async def send_shutdown_notification(self):
         """发送关闭通知。"""
-        message = "🛑 **Hyperliquid Copy Trader 已停止**\n\n"
+        message = "🛑 Hyperliquid Copy Trader 已停止\n\n"
         message += "系统已安全关闭。"
         await self.send_message(message)
 

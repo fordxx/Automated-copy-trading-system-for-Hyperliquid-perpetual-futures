@@ -103,10 +103,11 @@ class TradeMonitor:
         """
         try:
             current_time = int(time.time() * 1000)
+            current_time_s = time.time()  # Use consistent floating-point seconds for backoff
 
             # 检查是否处于速率限制退避期
             if self._rate_limit_backoff > 0:
-                backoff_remaining = self._rate_limit_backoff - (current_time / 1000)
+                backoff_remaining = self._rate_limit_backoff - current_time_s
                 if backoff_remaining > 0:
                     logger.debug(f"⏳ Rate limit backoff active, waiting {backoff_remaining:.1f}s more")
                     return []
@@ -191,7 +192,7 @@ class TradeMonitor:
 
                 # 计算指数退避时间：2^n * 10秒，最多5分钟
                 backoff_seconds = min(2 ** self._consecutive_429_errors * 10, self._max_backoff)
-                self._rate_limit_backoff = (int(time.time()) + backoff_seconds)
+                self._rate_limit_backoff = (time.time() + backoff_seconds)
 
                 logger.warning(f"⚠️ Rate limit (429) detected! Backing off for {backoff_seconds}s (attempt #{self._consecutive_429_errors})")
             else:
@@ -244,21 +245,34 @@ class TradeMonitor:
             side = fill.get("side", "")  # "B" for buy, "A" for sell
             leverage = int(fill.get("leverage", 1))
 
+            # Hyperliquid fills often include a human-readable direction like:
+            # "Open Long", "Open Short", "Close Long", "Close Short".
+            dir_text = str(fill.get("dir", "") or "").strip().lower()
+
             if not all([coin, size > 0, price > 0, timestamp > 0]):
                 logger.warning(f"Invalid fill data: {fill}")
                 return None
 
-            # 确定交易动作
-            # 在 Hyperliquid 中，side "B" 表示买入（开多或平空），"A" 表示卖出（开空或平多）
-            # 需要结合仓位信息来确定是开仓还是平仓
-            # 这里简化处理，假设都是开仓操作
-            if side == "B":
+            # 确定交易动作：优先使用 dir 字段，避免把“平仓/清仓”误判为“开反向仓”。
+            if dir_text.startswith("open") and "long" in dir_text:
                 action = TradeAction.OPEN_LONG
-            elif side == "A":
+            elif dir_text.startswith("open") and "short" in dir_text:
                 action = TradeAction.OPEN_SHORT
+            elif dir_text.startswith("close") and "long" in dir_text:
+                action = TradeAction.CLOSE_LONG
+            elif dir_text.startswith("close") and "short" in dir_text:
+                action = TradeAction.CLOSE_SHORT
             else:
-                logger.warning(f"Unknown side: {side}")
-                return None
+                # Fallback: best-effort by side
+                if side == "B":
+                    action = TradeAction.OPEN_LONG
+                elif side == "A":
+                    action = TradeAction.OPEN_SHORT
+                else:
+                    logger.warning(f"Unknown side: {side}")
+                    return None
+
+            direction = "long" if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG) else "short"
 
             return MonitoredTrade(
                 action=action,
@@ -268,7 +282,8 @@ class TradeMonitor:
                 leverage=leverage,
                 timestamp=timestamp,
                 tx_hash=tx_hash,
-                side=side
+                direction=direction,
+                side=side,
             )
 
         except Exception as e:
