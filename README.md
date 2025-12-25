@@ -48,6 +48,7 @@ nano .env
 - `MAX_POSITION_SIZE`: 单币种最大跟单仓位（合约数量上限）
 - `MAX_NOTIONAL_PER_TRADE_USD`: 单笔跟单名义金额上限（USD）；>0 时会在 `COPY_RATIO` 之后再次截断
 - `MIN_TRADE_SIZE`: 小于该数量的订单会被跳过（默认 0.01）
+- `MIN_ORDER_NOTIONAL_USD`: 最小订单名义金额（USD，交易所限制；默认 10）；小额平仓会被缓存等待凑够
 - `TRADE_BATCH_WINDOW_MS`: 交易批处理窗口（毫秒），降低 429 / 降噪
 - `WEBSOCKET_IDLE_TIMEOUT_S`: WebSocket 空闲超时（秒），超时自动重连
 - `WEBSOCKET_IDLE_LOG_INTERVAL_S`: WebSocket idle 重连告警日志节流（秒）

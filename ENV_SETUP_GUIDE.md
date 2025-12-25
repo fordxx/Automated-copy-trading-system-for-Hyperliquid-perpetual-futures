@@ -44,6 +44,9 @@ MAX_NOTIONAL_PER_TRADE_USD=0
 # 小于该数量的订单会跳过（默认 0.01）
 MIN_TRADE_SIZE=0.01
 
+# 最小订单名义金额（USD，交易所限制；默认 10）
+MIN_ORDER_NOTIONAL_USD=10
+
 # 批处理窗口（ms）：目标地址短时间内多笔成交会被聚合，降低 429
 TRADE_BATCH_WINDOW_MS=300
 

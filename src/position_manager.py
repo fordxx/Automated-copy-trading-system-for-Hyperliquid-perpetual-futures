@@ -126,6 +126,11 @@ class PositionManager:
         self._strict_gate_max_wait_s = float(os.getenv('POSITION_SYNC_STRICT_MAX_WAIT_S', '0') or 0)
         self._strict_gate_first_skip_at: Dict[Tuple[str, str], float] = {}
 
+        # Exchange minimum order notional guard (prevents 'Order must have minimum value of $10').
+        # Used primarily for market_close: we buffer tiny close requests until they reach min notional.
+        self._min_order_notional_usd = float(os.getenv('MIN_ORDER_NOTIONAL_USD', '10') or 10)
+        self._pending_close_debt_by_coin: Dict[str, float] = {}
+
         logger.info("✅ PositionManager initialized")
 
     async def initialize(self):
@@ -848,16 +853,58 @@ class PositionManager:
                 return 0.0
 
             decimals = await self._get_sz_decimals(coin)
-            close_size = min(float(size), abs(float(position.size)))
+            coin_key = str(coin)
+
+            requested = max(0.0, float(size))
+            if requested <= 0:
+                return 0.0
+
+            debt = float(self._pending_close_debt_by_coin.get(coin_key, 0.0) or 0.0)
+            desired = min(requested + max(0.0, debt), abs(float(position.size)))
+
+            close_size = desired
             close_size = self._round_down(close_size, decimals)
             if close_size <= 0:
                 logger.info(f"Market close skipped (rounded size=0): {coin}")
                 return 0.0
+
+            # Pre-check minimum notional: buffer tiny close requests instead of submitting/rejecting.
+            min_notional = float(self._min_order_notional_usd or 0.0)
+            if min_notional > 0:
+                mids = await self._get_mid_prices()
+                mid = float(mids.get(coin_key, 0.0) or 0.0)
+                notional = float(close_size) * float(mid) if mid > 0 else 0.0
+                if notional < min_notional:
+                    # Keep desired (pre-round) so future requests can accumulate.
+                    self._pending_close_debt_by_coin[coin_key] = float(desired)
+                    logger.warning(
+                        "🧩 Close buffered (min notional): %s size=%.6f mid=%.6g notional=$%.2f < $%.2f (debt=%.6f)",
+                        coin_key,
+                        float(close_size),
+                        float(mid),
+                        float(notional),
+                        float(min_notional),
+                        float(desired),
+                    )
+                    return 0.0
+
             result = await asyncio.to_thread(self.exchange.market_close, coin, close_size)
             logger.info(f"Market close: {coin} {close_size}, result: {result}")
             err = self._extract_order_error(result)
             if err:
+                # If still rejected due to min notional (price moved), keep buffering instead of raising.
+                if "minimum value" in str(err).lower():
+                    self._pending_close_debt_by_coin[coin_key] = float(desired)
+                    logger.warning(f"🧩 Close buffered after reject (min notional): {coin_key} desired={desired} err={err}")
+                    return 0.0
                 raise RuntimeError(f"market_close rejected: {err}")
+
+            # Successful submission: clear or reduce debt based on what we actually sent.
+            remaining = max(0.0, float(desired) - float(close_size))
+            if remaining > 0:
+                self._pending_close_debt_by_coin[coin_key] = float(remaining)
+            else:
+                self._pending_close_debt_by_coin.pop(coin_key, None)
             try:
                 self._last_bot_order_by_coin[str(coin)] = {"kind": "close", "ts": time.monotonic()}
             except Exception:
