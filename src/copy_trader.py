@@ -115,6 +115,31 @@ class HyperliquidCopyTrader:
         self._catchup_replay_spacing_s = _safe_get_env_float('CATCHUP_REPLAY_SPACING_S', 2.0, min_val=0.0, max_val=60.0)
         self._tg_update_offset: Optional[int] = None
 
+        # Periodic position ratio sync (corrective "snap-to" with price gating).
+        # Disabled by default for safety; enable via env:
+        #   POSITION_SYNC_ENABLED=true
+        self._position_sync_enabled = os.getenv('POSITION_SYNC_ENABLED', 'false').lower() == 'true'
+        self._position_sync_interval_s = _safe_get_env_float('POSITION_SYNC_INTERVAL_S', 300.0, min_val=30.0, max_val=86400.0)
+        self._position_sync_start_delay_s = _safe_get_env_float('POSITION_SYNC_START_DELAY_S', 30.0, min_val=0.0, max_val=3600.0)
+        self._position_sync_min_rel_diff = _safe_get_env_float('POSITION_SYNC_MIN_REL_DIFF', 0.05, min_val=0.0, max_val=1.0)
+        # Price gate: only execute sync orders when mid is not worse than reference entry by this pct.
+        # 0.0 means "strict better-or-equal".
+        self._position_sync_allow_worse_pct = _safe_get_env_float('POSITION_SYNC_ALLOW_WORSE_PCT', 0.0, min_val=0.0, max_val=0.5)
+        # Stricter gate: compare current mid vs leader's latest OPEN fill price for the same side.
+        # Values: "strict_fill_open" (strictly better) | "entry" (entryPx-based, allows allow_worse_pct)
+        self._position_sync_price_ref_mode = os.getenv('POSITION_SYNC_PRICE_REF_MODE', 'strict_fill_open').strip().lower()
+        # If strict fill ref is missing, either "skip" (default) or fall back to "entry".
+        self._position_sync_fill_ref_fallback = os.getenv('POSITION_SYNC_FILL_REF_FALLBACK', 'skip').strip().lower()
+        # Optional spread gate (default OFF): avoid syncing in wide markets.
+        self._position_sync_spread_gate_enabled = os.getenv('POSITION_SYNC_SPREAD_GATE_ENABLED', 'false').lower() == 'true'
+        self._position_sync_max_spread_bps = _safe_get_env_float('POSITION_SYNC_MAX_SPREAD_BPS', 0.0, min_val=0.0, max_val=1000.0)
+        # By default we always allow reductions (risk-off) even if price is "not ideal".
+        self._position_sync_gate_reductions = os.getenv('POSITION_SYNC_GATE_REDUCTIONS', 'false').lower() == 'true'
+        self._position_sync_min_notional_usd = _safe_get_env_float('POSITION_SYNC_MIN_NOTIONAL_USD', 10.0, min_val=0.0)
+        self._position_sync_default_leverage = _safe_get_env_int('POSITION_SYNC_DEFAULT_LEVERAGE', 5, min_val=1, max_val=50)
+        self._position_sync_task: Optional[asyncio.Task] = None
+        self._position_sync_lock = asyncio.Lock()
+
         # 初始化 Hyperliquid 客户端
         self._init_hyperliquid_clients()
 
@@ -383,6 +408,20 @@ class HyperliquidCopyTrader:
             await self.notification_manager.notify_startup()
             await self._notify_startup_config_summary()
 
+        # Start periodic position sync (independent of WS/REST monitoring loops).
+        if self._position_sync_enabled and self.position_manager:
+            logger.warning(
+                "🧭 Position sync ENABLED: interval=%ss price_mode=%s fallback=%s spread_gate=%s max_spread_bps=%s allow_worse_pct=%s gate_reductions=%s",
+                int(self._position_sync_interval_s),
+                str(self._position_sync_price_ref_mode),
+                str(self._position_sync_fill_ref_fallback),
+                bool(self._position_sync_spread_gate_enabled),
+                float(self._position_sync_max_spread_bps),
+                float(self._position_sync_allow_worse_pct),
+                bool(self._position_sync_gate_reductions),
+            )
+            self._position_sync_task = asyncio.create_task(self._position_sync_loop())
+
         # 设置信号处理
         # Background runs (setsid/nohup with stdin=/dev/null) should not be stoppable
         # by stray SIGINT (signal 2). We still stop on SIGTERM for service management.
@@ -420,6 +459,14 @@ class HyperliquidCopyTrader:
             # 停止WebSocket
             if self.ws_monitor:
                 await self.ws_monitor.stop()
+
+            # Stop background sync loop.
+            if self._position_sync_task and not self._position_sync_task.done():
+                self._position_sync_task.cancel()
+                try:
+                    await self._position_sync_task
+                except Exception:
+                    pass
 
             # 发送关闭通知
             if self.notification_manager:
@@ -483,11 +530,97 @@ class HyperliquidCopyTrader:
                 f"最多补单数量: `{self._catchup_max_trades}`",
                 f"重连后延迟（秒）: `{int(self._catchup_start_delay_s)}`",
                 f"补单间隔（秒/笔）: `{float(self._catchup_replay_spacing_s):.1f}`",
+                "",
+                "*仓位纠偏（Position Sync）*",
+                f"是否启用: `{self._position_sync_enabled}`",
+                f"检查间隔（秒）: `{int(self._position_sync_interval_s)}`",
+                f"价格参考模式: `{str(self._position_sync_price_ref_mode)}`",
+                f"严格模式缺失参考价回退: `{str(self._position_sync_fill_ref_fallback)}`",
+                f"点差门控: `{bool(self._position_sync_spread_gate_enabled)}` / max_bps=`{float(self._position_sync_max_spread_bps)}`",
+                f"价格容忍（pct）: `{float(self._position_sync_allow_worse_pct)}`",
+                f"是否也对减仓做价格门控: `{bool(self._position_sync_gate_reductions)}`",
             ]
 
             await tg.send_message("\n".join(lines))
         except Exception as e:
             logger.debug(f"Failed to send startup self-check: {e}")
+
+    async def _position_sync_loop(self) -> None:
+        """Periodically correct follower positions towards leader * ratio, with price gating."""
+        if not self.position_manager:
+            return
+
+        try:
+            if self._position_sync_start_delay_s > 0:
+                await asyncio.sleep(float(self._position_sync_start_delay_s))
+        except Exception:
+            pass
+
+        while self.running:
+            try:
+                await asyncio.sleep(float(self._position_sync_interval_s))
+                if not self.running:
+                    break
+
+                # Don't fight risk halt/stop-loss controls.
+                if getattr(self, "_trading_halted", False):
+                    continue
+
+                async with self._position_sync_lock:
+                    leader_address = str(self.config.get("target_address", "") or "")
+                    if not leader_address:
+                        continue
+
+                    copy_cfg = self.config.get("copy_trading", {}) or {}
+                    copy_ratio = float(copy_cfg.get("copy_ratio", 0.1) or 0.1)
+                    min_trade_size = float(copy_cfg.get("min_trade_size", 0.01) or 0.01)
+                    max_notional = float(copy_cfg.get("max_notional_per_trade_usd", 0.0) or 0.0)
+
+                    # Default leverage for sync opens: env override, otherwise bounded by MAX_LEVERAGE.
+                    max_lev = int(copy_cfg.get("max_leverage", 5) or 5)
+                    default_lev = int(self._position_sync_default_leverage)
+                    default_lev = max(1, min(default_lev, max_lev))
+
+                    report = await self.position_manager.execute_ratio_sync(
+                        leader_address=leader_address,
+                        copy_ratio=copy_ratio,
+                        min_trade_size=min_trade_size,
+                        max_notional_per_trade_usd=max_notional,
+                        min_notional_usd=float(self._position_sync_min_notional_usd),
+                        min_rel_diff=float(self._position_sync_min_rel_diff),
+                        allow_worse_pct=float(self._position_sync_allow_worse_pct),
+                        gate_reductions=bool(self._position_sync_gate_reductions),
+                        default_leverage=int(default_lev),
+                        price_ref_mode=str(self._position_sync_price_ref_mode),
+                        fill_ref_fallback=str(self._position_sync_fill_ref_fallback),
+                        spread_gate_enabled=bool(self._position_sync_spread_gate_enabled),
+                        max_spread_bps=float(self._position_sync_max_spread_bps),
+                    )
+
+                    if report.get("status") != "ok":
+                        logger.warning(f"Position sync plan failed: {report}")
+                        continue
+
+                    submitted = int(report.get("submitted", 0) or 0)
+                    skipped = int(report.get("skipped_count", 0) or 0)
+                    total_notional = float(report.get("total_notional", 0.0) or 0.0)
+                    errors = int(report.get("errors", 0) or 0)
+
+                    if submitted or errors:
+                        logger.warning(
+                            "🧭 Position sync: submitted=%s errors=%s skipped(price/constraints)=%s total_notional=$%.2f",
+                            submitted,
+                            errors,
+                            skipped,
+                            total_notional,
+                        )
+                    else:
+                        logger.info("🧭 Position sync: noop (nothing eligible now)")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Position sync loop error: {e}")
 
     async def stop(self):
         """停止跟单交易器。"""

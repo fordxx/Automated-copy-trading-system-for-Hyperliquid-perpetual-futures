@@ -54,6 +54,9 @@ nano .env
 - `IGNORE_SIGINT_WHEN_DETACHED`: 后台运行时忽略 SIGINT（默认 true，避免 Ctrl+C / stray SIGINT 误停）
 - `FLIP_WAIT_FOR_CLOSE`: 翻仓更稳模式（默认 true：先平再开，等待对侧仓位消失）
 - `FLIP_WAIT_TIMEOUT_S`/`FLIP_WAIT_POLL_S`/`FLIP_OPEN_ON_TIMEOUT`: 翻仓等待细节
+- `POSITION_SYNC_ENABLED`: 仓位纠偏（默认 false：定期把 follower 仓位拉回 leader*比例）
+- `POSITION_SYNC_PRICE_REF_MODE`: 纠偏价格门控模式（推荐 `strict_fill_open`：当前 mid 必须严格更优）
+- `POSITION_SYNC_SPREAD_GATE_ENABLED`/`POSITION_SYNC_MAX_SPREAD_BPS`: 点差门控（默认关闭，避免宽点差时纠偏）
 
 ### 方式二：YAML配置文件
 

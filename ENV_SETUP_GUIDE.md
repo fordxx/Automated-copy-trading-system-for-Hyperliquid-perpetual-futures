@@ -60,6 +60,29 @@ FLIP_WAIT_TIMEOUT_S=6
 FLIP_WAIT_POLL_S=0.75
 FLIP_OPEN_ON_TIMEOUT=false
 
+# 仓位纠偏（Position Sync，可选，默认关闭）
+# 定期对比 follower 当前仓位 vs leader 当前仓位 * COPY_RATIO，并在满足“价格门控”时补差。
+POSITION_SYNC_ENABLED=false
+POSITION_SYNC_INTERVAL_S=300
+POSITION_SYNC_START_DELAY_S=30
+POSITION_SYNC_MIN_REL_DIFF=0.05
+POSITION_SYNC_MIN_NOTIONAL_USD=10
+POSITION_SYNC_DEFAULT_LEVERAGE=5
+
+# 更严格的价格门控（推荐）：用 leader 最近一次 OPEN 成交价做参考，且要求当前 mid “严格更优”
+POSITION_SYNC_PRICE_REF_MODE=strict_fill_open
+POSITION_SYNC_FILL_REF_FALLBACK=skip
+
+# 若用 entryPx 模式：允许比参考价更差的容忍度（0 表示不更差）
+POSITION_SYNC_ALLOW_WORSE_PCT=0.0
+
+# 是否让“减仓/平仓”也受价格门控影响（默认 false：减仓更安全，允许直接执行）
+POSITION_SYNC_GATE_REDUCTIONS=false
+
+# 额外门控（默认关闭）：点差过大时不纠偏
+POSITION_SYNC_SPREAD_GATE_ENABLED=false
+POSITION_SYNC_MAX_SPREAD_BPS=0
+
 # Telegram通知 (可选)
 TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=从BotFather获取的令牌

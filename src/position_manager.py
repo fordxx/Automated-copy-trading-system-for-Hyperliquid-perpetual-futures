@@ -38,6 +38,22 @@ class Position:
         return self.size < 0
 
 
+@dataclass(frozen=True)
+class SyncOrder:
+    coin: str
+    kind: str  # "open" | "close"
+    size: float
+    is_buy: Optional[bool]  # only meaningful for "open" (and for price gating decisions)
+    price: float
+    notional: float
+    reason: str
+    follower_before: float
+    expected: float
+    leader_entry_px: float
+    reference_entry_px: float
+    sz_decimals: int
+
+
 class PositionManager:
     """仓位管理器。
 
@@ -792,3 +808,487 @@ class PositionManager:
                 for pos in self.positions.values()
             ]
         }
+
+    # -------------------------
+    # Position sync (ratio fix)
+    # -------------------------
+
+    def _positions_from_user_state_with_entry(self, user_state: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+        """Extract {coin: {size, entry_px}} from a Hyperliquid user_state payload."""
+        out: Dict[str, Dict[str, float]] = {}
+        asset_positions = user_state.get("assetPositions") if isinstance(user_state, dict) else None
+        if not isinstance(asset_positions, list):
+            return out
+        for entry in asset_positions:
+            if not isinstance(entry, dict):
+                continue
+            position_data = entry.get("position") if isinstance(entry.get("position"), dict) else {}
+            coin = position_data.get("coin") or entry.get("coin")
+            if not coin:
+                continue
+            try:
+                size = float(position_data.get("szi", 0) or 0)
+            except Exception:
+                size = 0.0
+            if size == 0:
+                continue
+            try:
+                entry_px = float(position_data.get("entryPx", 0) or 0)
+            except Exception:
+                entry_px = 0.0
+            out[str(coin)] = {"size": float(size), "entry_px": float(entry_px)}
+        return out
+
+    async def _get_mid_prices(self) -> Dict[str, float]:
+        try:
+            mids_raw = await asyncio.to_thread(self.info.all_mids)
+        except Exception as e:
+            logger.warning(f"Failed to fetch mids: {e}")
+            return {}
+        mids: Dict[str, float] = {}
+        if isinstance(mids_raw, dict):
+            for k, v in mids_raw.items():
+                try:
+                    mids[str(k)] = float(v)
+                except Exception:
+                    continue
+        return mids
+
+    async def _get_best_bid_ask(self, coin: str) -> Optional[Tuple[float, float]]:
+        """Return (best_bid, best_ask) from L2 snapshot if available."""
+        coin = str(coin or "")
+        if not coin:
+            return None
+        try:
+            snap = await asyncio.to_thread(self.info.l2_snapshot, coin)
+        except Exception as e:
+            logger.debug(f"Failed to fetch l2_snapshot for {coin}: {e}")
+            return None
+
+        if not isinstance(snap, dict):
+            return None
+        levels = snap.get("levels")
+        if not (isinstance(levels, list) and len(levels) >= 2):
+            return None
+        bids = levels[0]
+        asks = levels[1]
+        if not (isinstance(bids, list) and bids and isinstance(asks, list) and asks):
+            return None
+        try:
+            best_bid = float(bids[0].get("px", 0) or 0)
+            best_ask = float(asks[0].get("px", 0) or 0)
+        except Exception:
+            return None
+        if best_bid <= 0 or best_ask <= 0:
+            return None
+        return float(best_bid), float(best_ask)
+
+    def _spread_bps(self, *, bid: float, ask: float, mid: float) -> Optional[float]:
+        if bid <= 0 or ask <= 0 or mid <= 0:
+            return None
+        if ask < bid:
+            return None
+        return (float(ask) - float(bid)) / float(mid) * 10000.0
+
+    def _latest_open_fill_px_by_coin_side(self, fills: Any) -> Dict[str, Dict[str, float]]:
+        """Build {coin: {B: px, A: px}} from leader fills, using the latest OPEN fill per side."""
+        out: Dict[str, Dict[str, float]] = {}
+        if not isinstance(fills, list):
+            return out
+
+        # Track latest time to pick newest fill per (coin, side)
+        latest_ts: Dict[Tuple[str, str], int] = {}
+        for f in fills:
+            if not isinstance(f, dict):
+                continue
+            try:
+                coin = str(f.get("coin", "") or "")
+                side = str(f.get("side", "") or "")
+                if not coin or side not in ("B", "A"):
+                    continue
+                px = float(f.get("px", 0) or 0)
+                if px <= 0:
+                    continue
+                ts = int(f.get("time", 0) or 0)
+                dir_text = str(f.get("dir", "") or "").strip().lower()
+                if not dir_text.startswith("open"):
+                    continue
+            except Exception:
+                continue
+
+            key = (coin, side)
+            prev = latest_ts.get(key, -1)
+            if ts >= prev:
+                latest_ts[key] = ts
+                out.setdefault(coin, {})[side] = float(px)
+        return out
+
+    def _is_strict_better_vs_fill(self, *, is_buy: bool, mid: float, leader_fill_px: float) -> bool:
+        """Strict better:
+        - BUY: mid < leader_fill_px
+        - SELL: mid > leader_fill_px
+        """
+        if leader_fill_px <= 0 or mid <= 0:
+            return False
+        return (float(mid) < float(leader_fill_px)) if is_buy else (float(mid) > float(leader_fill_px))
+
+    def _is_price_favorable(self, *, is_buy: bool, mid: float, reference_entry_px: float, allow_worse_pct: float) -> bool:
+        """Price gate: only trade when mid price is not worse than reference entry by allow_worse_pct.
+
+        - BUY (increase long / cover short): favorable when mid <= ref * (1 + allow_worse_pct)
+        - SELL (increase short / sell long): favorable when mid >= ref * (1 - allow_worse_pct)
+        """
+        if reference_entry_px <= 0 or mid <= 0:
+            return True
+        allow = max(0.0, float(allow_worse_pct))
+        ref = float(reference_entry_px)
+        if is_buy:
+            return float(mid) <= ref * (1.0 + allow)
+        return float(mid) >= ref * (1.0 - allow)
+
+    def _chunk_sizes(
+        self,
+        *,
+        total_size: float,
+        price: float,
+        sz_decimals: int,
+        min_trade_size: float,
+        max_notional_per_trade_usd: float,
+        min_notional_usd: float,
+    ) -> List[float]:
+        remaining = float(abs(total_size))
+        if remaining <= 0 or price <= 0:
+            return []
+
+        chunks: List[float] = []
+        while remaining > 0:
+            raw_size = remaining
+            if max_notional_per_trade_usd and max_notional_per_trade_usd > 0:
+                raw_size = min(raw_size, float(max_notional_per_trade_usd) / float(price))
+
+            chunk = self._round_down(float(raw_size), int(sz_decimals))
+            if chunk <= 0:
+                break
+            if chunk < float(min_trade_size):
+                break
+            if float(chunk) * float(price) < float(min_notional_usd):
+                break
+
+            chunks.append(float(chunk))
+            remaining = max(0.0, remaining - float(chunk))
+
+            # Avoid infinite loops from rounding.
+            if remaining > 0 and remaining < (10 ** (-max(0, min(8, int(sz_decimals))))):
+                break
+
+        return chunks
+
+    async def plan_ratio_sync(
+        self,
+        *,
+        leader_address: str,
+        copy_ratio: float,
+        min_trade_size: float,
+        max_notional_per_trade_usd: float,
+        min_notional_usd: float,
+        min_rel_diff: float,
+        allow_worse_pct: float,
+        gate_reductions: bool,
+        price_ref_mode: str = "entry",  # "entry" | "strict_fill_open"
+        fill_ref_fallback: str = "skip",  # "skip" | "entry"
+        spread_gate_enabled: bool = False,
+        max_spread_bps: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Plan ratio-sync orders (does not execute)."""
+        await self.update_positions(force=True)
+
+        try:
+            leader_state = await asyncio.to_thread(self.info.user_state, leader_address)
+        except Exception as e:
+            return {"status": "error", "reason": f"leader_user_state_failed: {e}", "orders": []}
+
+        leader_positions = self._positions_from_user_state_with_entry(leader_state if isinstance(leader_state, dict) else {})
+        mids = await self._get_mid_prices()
+
+        leader_fill_px_by_coin_side: Dict[str, Dict[str, float]] = {}
+        if str(price_ref_mode).strip().lower() == "strict_fill_open":
+            try:
+                fills = await asyncio.to_thread(self.info.user_fills, leader_address)
+                leader_fill_px_by_coin_side = self._latest_open_fill_px_by_coin_side(fills)
+            except Exception as e:
+                logger.warning(f"Failed to fetch leader fills for strict gating: {e}")
+
+        coins = sorted(set(leader_positions.keys()) | set(self.positions.keys()))
+        orders: List[SyncOrder] = []
+        skipped: List[Dict[str, Any]] = []
+        l2_cache: Dict[str, Dict[str, float]] = {}
+
+        for coin in coins:
+            leader_size = float(leader_positions.get(coin, {}).get("size", 0.0))
+            leader_entry_px = float(leader_positions.get(coin, {}).get("entry_px", 0.0))
+
+            follower_pos = self.get_position(coin)
+            follower_size = float(follower_pos.size) if follower_pos else 0.0
+            follower_entry_px = float(follower_pos.entry_price) if follower_pos else 0.0
+
+            expected = float(leader_size) * float(copy_ratio)
+            mid = float(mids.get(coin, 0.0) or 0.0)
+            if mid <= 0:
+                continue
+
+            # Ignore tiny diffs unless expected is near zero (then use notional threshold only).
+            diff = expected - follower_size
+            if diff == 0:
+                continue
+
+            rel = abs(diff) / abs(expected) if abs(expected) > 0 else 999.0
+            if abs(expected) > 0 and rel < float(min_rel_diff):
+                continue
+
+            ref_entry = leader_entry_px if leader_entry_px > 0 else follower_entry_px
+
+            # Determine required operations.
+            want_sign = 1 if expected > 0 else (-1 if expected < 0 else 0)
+            have_sign = 1 if follower_size > 0 else (-1 if follower_size < 0 else 0)
+
+            # A: close-to-zero target
+            ops: List[Tuple[str, float, Optional[bool], str]] = []
+            if want_sign == 0:
+                if have_sign != 0:
+                    ops.append(("close", abs(follower_size), (have_sign < 0), "flatten"))
+            # B: empty follower
+            elif have_sign == 0:
+                ops.append(("open", abs(expected), (want_sign > 0), "open_to_target"))
+            # C: same side
+            elif want_sign == have_sign:
+                if abs(expected) > abs(follower_size):
+                    ops.append(("open", abs(expected - follower_size), (want_sign > 0), "top_up"))
+                elif abs(expected) < abs(follower_size):
+                    # close reduces exposure; for gating decisions, close-long is SELL (is_buy=False),
+                    # close-short is BUY (is_buy=True).
+                    ops.append(("close", abs(follower_size - expected), (have_sign < 0), "reduce"))
+            # D: flip
+            else:
+                ops.append(("close", abs(follower_size), (have_sign < 0), "flip_close"))
+                ops.append(("open", abs(expected), (want_sign > 0), "flip_open"))
+
+            for kind, total_size, is_buy, reason in ops:
+                decimals = await self._get_sz_decimals(coin)
+                chunks = self._chunk_sizes(
+                    total_size=total_size,
+                    price=mid,
+                    sz_decimals=int(decimals),
+                    min_trade_size=float(min_trade_size),
+                    max_notional_per_trade_usd=float(max_notional_per_trade_usd),
+                    min_notional_usd=float(min_notional_usd),
+                )
+                if not chunks:
+                    continue
+
+                for chunk in chunks:
+                    notional = float(chunk) * float(mid)
+                    # Gate by price when requested.
+                    should_gate = True
+                    if kind == "close" and not gate_reductions:
+                        should_gate = False
+
+                    # Optional spread gate (default OFF): skip when market is too wide.
+                    if should_gate and bool(spread_gate_enabled) and float(max_spread_bps or 0.0) > 0:
+                        cached = l2_cache.get(coin)
+                        if cached is None:
+                            ba = await self._get_best_bid_ask(coin)
+                            if ba:
+                                bid, ask = ba
+                                sbps = self._spread_bps(bid=bid, ask=ask, mid=mid)
+                                cached = {"bid": float(bid), "ask": float(ask), "spread_bps": float(sbps or 0.0)}
+                            else:
+                                cached = {"bid": 0.0, "ask": 0.0, "spread_bps": 0.0}
+                            l2_cache[coin] = cached
+
+                        sbps_val = float(cached.get("spread_bps", 0.0) or 0.0)
+                        # If we cannot compute spread, be conservative: skip in spread-gated mode.
+                        if sbps_val <= 0:
+                            skipped.append(
+                                {
+                                    "coin": coin,
+                                    "kind": kind,
+                                    "size": float(chunk),
+                                    "price": float(mid),
+                                    "reason": f"spread_unavailable:{reason}",
+                                }
+                            )
+                            continue
+
+                        if sbps_val > float(max_spread_bps):
+                            skipped.append(
+                                {
+                                    "coin": coin,
+                                    "kind": kind,
+                                    "size": float(chunk),
+                                    "price": float(mid),
+                                    "bid": float(cached.get("bid", 0.0) or 0.0),
+                                    "ask": float(cached.get("ask", 0.0) or 0.0),
+                                    "spread_bps": float(sbps_val),
+                                    "max_spread_bps": float(max_spread_bps),
+                                    "reason": f"spread_too_wide:{reason}",
+                                }
+                            )
+                            continue
+
+                    if should_gate and is_buy is not None:
+                        mode = str(price_ref_mode).strip().lower()
+                        ok = True
+                        if mode == "strict_fill_open":
+                            side = "B" if bool(is_buy) else "A"
+                            fill_px = float(leader_fill_px_by_coin_side.get(coin, {}).get(side, 0.0) or 0.0)
+                            ok = self._is_strict_better_vs_fill(is_buy=bool(is_buy), mid=float(mid), leader_fill_px=float(fill_px))
+                            if (not ok) and str(fill_ref_fallback).strip().lower() == "entry":
+                                ok = self._is_price_favorable(
+                                    is_buy=bool(is_buy),
+                                    mid=float(mid),
+                                    reference_entry_px=float(ref_entry),
+                                    allow_worse_pct=float(allow_worse_pct),
+                                )
+                            if not ok:
+                                skipped.append(
+                                    {
+                                        "coin": coin,
+                                        "kind": kind,
+                                        "size": float(chunk),
+                                        "price": float(mid),
+                                        "leader_fill_px": float(fill_px),
+                                        "fallback": str(fill_ref_fallback),
+                                        "reason": f"strict_fill_not_better:{reason}",
+                                    }
+                                )
+                                continue
+                        else:
+                            ok = self._is_price_favorable(
+                                is_buy=bool(is_buy),
+                                mid=float(mid),
+                                reference_entry_px=float(ref_entry),
+                                allow_worse_pct=float(allow_worse_pct),
+                            )
+                            if not ok:
+                                skipped.append(
+                                    {
+                                        "coin": coin,
+                                        "kind": kind,
+                                        "size": float(chunk),
+                                        "price": float(mid),
+                                        "reference_entry_px": float(ref_entry),
+                                        "allow_worse_pct": float(allow_worse_pct),
+                                        "reason": f"price_not_favorable:{reason}",
+                                    }
+                                )
+                                continue
+
+                    orders.append(
+                        SyncOrder(
+                            coin=str(coin),
+                            kind=str(kind),
+                            size=float(chunk),
+                            is_buy=bool(is_buy) if is_buy is not None else None,
+                            price=float(mid),
+                            notional=float(notional),
+                            reason=str(reason),
+                            follower_before=float(follower_size),
+                            expected=float(expected),
+                            leader_entry_px=float(leader_entry_px),
+                            reference_entry_px=float(ref_entry),
+                            sz_decimals=int(decimals),
+                        )
+                    )
+
+        total_notional = sum(o.notional for o in orders)
+        return {
+            "status": "ok",
+            "leader_address": str(leader_address),
+            "copy_ratio": float(copy_ratio),
+            "price_ref_mode": str(price_ref_mode),
+            "fill_ref_fallback": str(fill_ref_fallback),
+            "spread_gate_enabled": bool(spread_gate_enabled),
+            "max_spread_bps": float(max_spread_bps or 0.0),
+            "orders": orders,
+            "orders_count": int(len(orders)),
+            "total_notional": float(total_notional),
+            "skipped": skipped,
+            "skipped_count": int(len(skipped)),
+        }
+
+    async def execute_ratio_sync(
+        self,
+        *,
+        leader_address: str,
+        copy_ratio: float,
+        min_trade_size: float,
+        max_notional_per_trade_usd: float,
+        min_notional_usd: float,
+        min_rel_diff: float,
+        allow_worse_pct: float,
+        gate_reductions: bool,
+        default_leverage: int,
+        price_ref_mode: str = "entry",
+        fill_ref_fallback: str = "skip",
+        spread_gate_enabled: bool = False,
+        max_spread_bps: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Execute ratio-sync orders (price-gated)."""
+        plan = await self.plan_ratio_sync(
+            leader_address=leader_address,
+            copy_ratio=copy_ratio,
+            min_trade_size=min_trade_size,
+            max_notional_per_trade_usd=max_notional_per_trade_usd,
+            min_notional_usd=min_notional_usd,
+            min_rel_diff=min_rel_diff,
+            allow_worse_pct=allow_worse_pct,
+            gate_reductions=gate_reductions,
+            price_ref_mode=price_ref_mode,
+            fill_ref_fallback=fill_ref_fallback,
+            spread_gate_enabled=spread_gate_enabled,
+            max_spread_bps=max_spread_bps,
+        )
+        if plan.get("status") != "ok":
+            return plan
+
+        orders: List[SyncOrder] = list(plan.get("orders") or [])
+        if not orders:
+            return {**plan, "exec_status": "noop", "submitted": 0, "errors": 0, "results": []}
+
+        results: List[Dict[str, Any]] = []
+        errors = 0
+        submitted = 0
+
+        for o in orders:
+            try:
+                if o.kind == "close":
+                    # market_close reduces position regardless of side
+                    closed = await self._market_close_partial(o.coin, float(o.size))
+                    results.append({"coin": o.coin, "kind": o.kind, "size": float(o.size), "closed": float(closed or 0.0), "reason": o.reason})
+                    submitted += 1
+                    continue
+
+                if o.kind == "open":
+                    lev = int(default_leverage)
+                    if lev < 1:
+                        lev = 1
+                    await self._set_leverage(o.coin, lev)
+                    await self._market_open(o.coin, bool(o.is_buy), float(o.size))
+                    results.append({"coin": o.coin, "kind": o.kind, "size": float(o.size), "is_buy": bool(o.is_buy), "reason": o.reason})
+                    submitted += 1
+                    continue
+
+                results.append({"coin": o.coin, "kind": o.kind, "size": float(o.size), "error": "unknown_kind"})
+                errors += 1
+
+            except Exception as e:
+                errors += 1
+                results.append({"coin": o.coin, "kind": o.kind, "size": float(o.size), "error": str(e)})
+
+        # Refresh lazily after submissions.
+        try:
+            self.schedule_refresh(delay_s=1.0)
+        except Exception:
+            pass
+
+        return {**plan, "exec_status": "submitted", "submitted": int(submitted), "errors": int(errors), "results": results}
