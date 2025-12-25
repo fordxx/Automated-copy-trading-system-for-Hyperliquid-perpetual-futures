@@ -558,17 +558,15 @@ class HyperliquidCopyTrader:
 
         while self.running:
             try:
-                await asyncio.sleep(float(self._position_sync_interval_s))
-                if not self.running:
-                    break
-
                 # Don't fight risk halt/stop-loss controls.
                 if getattr(self, "_trading_halted", False):
+                    await asyncio.sleep(float(self._position_sync_interval_s))
                     continue
 
                 async with self._position_sync_lock:
                     leader_address = str(self.config.get("target_address", "") or "")
                     if not leader_address:
+                        await asyncio.sleep(float(self._position_sync_interval_s))
                         continue
 
                     copy_cfg = self.config.get("copy_trading", {}) or {}
@@ -616,6 +614,8 @@ class HyperliquidCopyTrader:
                         )
                     else:
                         logger.info("🧭 Position sync: noop (nothing eligible now)")
+
+                await asyncio.sleep(float(self._position_sync_interval_s))
 
             except asyncio.CancelledError:
                 break
