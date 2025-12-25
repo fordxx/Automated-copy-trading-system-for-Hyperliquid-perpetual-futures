@@ -99,6 +99,9 @@ class HyperliquidCopyTrader:
         # Reconnect catch-up (optional): after WS reconnect, backfill a bounded window via REST,
         # but only if the current price is strictly better than the original fill.
         self._catchup_enabled = os.getenv('CATCHUP_ENABLED', 'true').lower() == 'true'
+        # Safety: default OFF. Replaying OPEN fills on reconnect/startup can double exposure.
+        # Keep CLOSE replays for correctness, but treat OPEN replays as opt-in.
+        self._catchup_replay_opens = os.getenv('CATCHUP_REPLAY_OPENS', 'false').lower() == 'true'
         self._catchup_window_s = _safe_get_env_float('CATCHUP_WINDOW_S', 600.0, min_val=0.0, max_val=86400.0)
         self._catchup_max_trades = _safe_get_env_int('CATCHUP_MAX_TRADES', 200, min_val=1, max_val=10000)
         self._catchup_min_interval_s = _safe_get_env_float('CATCHUP_MIN_INTERVAL_S', 30.0, min_val=0.0)
@@ -528,6 +531,7 @@ class HyperliquidCopyTrader:
                 "",
                 "*断线恢复补单（Catch-up）*",
                 f"是否启用: `{self._catchup_enabled}`",
+                f"是否回放 OPEN: `{self._catchup_replay_opens}`",
                 f"是否需要人工确认: `{self._catchup_require_approval}`",
                 f"回看窗口（秒）: `{int(self._catchup_window_s)}`",
                 f"最多补单数量: `{self._catchup_max_trades}`",
@@ -941,6 +945,10 @@ class HyperliquidCopyTrader:
 
                 is_open = action in (TradeAction.OPEN_LONG, TradeAction.OPEN_SHORT)
                 if is_open:
+                    if not getattr(self, '_catchup_replay_opens', False):
+                        processed.add(txh)
+                        continue
+
                     # Strictly better only for OPENs:
                     # - If we need to BUY, current mid must be strictly lower.
                     # - If we need to SELL, current mid must be strictly higher.

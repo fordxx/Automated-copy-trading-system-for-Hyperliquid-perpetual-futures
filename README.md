@@ -51,6 +51,7 @@ nano .env
 - `TRADE_BATCH_WINDOW_MS`: 交易批处理窗口（毫秒），降低 429 / 降噪
 - `WEBSOCKET_IDLE_TIMEOUT_S`: WebSocket 空闲超时（秒），超时自动重连
 - `WEBSOCKET_IDLE_LOG_INTERVAL_S`: WebSocket idle 重连告警日志节流（秒）
+- `CATCHUP_REPLAY_OPENS`: 断线恢复补单是否回放 OPEN（默认 false，避免重复开仓导致仓位翻倍）
 - `IGNORE_SIGINT_WHEN_DETACHED`: 后台运行时忽略 SIGINT（默认 true，避免 Ctrl+C / stray SIGINT 误停）
 - `FLIP_WAIT_FOR_CLOSE`: 翻仓更稳模式（默认 true：先平再开，等待对侧仓位消失）
 - `FLIP_WAIT_TIMEOUT_S`/`FLIP_WAIT_POLL_S`/`FLIP_OPEN_ON_TIMEOUT`: 翻仓等待细节
