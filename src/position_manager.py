@@ -131,7 +131,19 @@ class PositionManager:
         self._min_order_notional_usd = float(os.getenv('MIN_ORDER_NOTIONAL_USD', '10') or 10)
         self._pending_close_debt_by_coin: Dict[str, float] = {}
 
+        # Per-coin execution locks: prevent concurrent order decisions/executions for the same coin
+        # across different flows (real-time fills vs position sync/catch-up).
+        self._coin_locks: Dict[str, asyncio.Lock] = {}
+
         logger.info("✅ PositionManager initialized")
+
+    def _get_coin_lock(self, coin: str) -> asyncio.Lock:
+        coin = str(coin or "")
+        lock = self._coin_locks.get(coin)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._coin_locks[coin] = lock
+        return lock
 
     async def initialize(self):
         """Initialize position manager (call after construction).
@@ -368,6 +380,12 @@ class PositionManager:
         - 如果方向与当前持仓相反，则优先 reduce/close（极速平仓）。
         - SDK 调用全部放到线程，避免阻塞 asyncio 事件循环。
         """
+        coin = str(getattr(trade, "coin", "") or "")
+        if not coin:
+            return {"status": "skipped", "reason": "missing_coin", "coin": "", "action": str(getattr(trade, "action", ""))}
+
+        lock = self._get_coin_lock(coin)
+        await lock.acquire()
         try:
             requested_size = float(getattr(trade, 'size', 0) or 0) * float(copy_ratio)
             copy_size_before_caps = float(requested_size)
@@ -390,7 +408,6 @@ class PositionManager:
                 copy_size = min(copy_size, notional_cap_size)
 
             # Round size to allowed precision.
-            coin = trade.coin
             decimals = await self._get_sz_decimals(coin)
             copy_size_rounded = self._round_down(copy_size, decimals)
             rounded_down = copy_size_rounded != copy_size
@@ -706,6 +723,11 @@ class PositionManager:
                 "max_size": float(max_size),
                 "max_notional_per_trade_usd": float(max_notional_per_trade_usd or 0.0),
             }
+        finally:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
     async def _refresh_sz_decimals_cache(self) -> None:
         """Refresh szDecimals cache from meta API.
@@ -1507,6 +1529,8 @@ class PositionManager:
         submitted = 0
 
         for o in orders:
+            lock = self._get_coin_lock(o.coin)
+            await lock.acquire()
             try:
                 if o.kind == "close":
                     # market_close reduces position regardless of side
@@ -1532,6 +1556,11 @@ class PositionManager:
             except Exception as e:
                 errors += 1
                 results.append({"coin": o.coin, "kind": o.kind, "size": float(o.size), "error": str(e)})
+            finally:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
         # Refresh lazily after submissions.
         try:

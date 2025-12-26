@@ -113,9 +113,12 @@ class TradeBatcher:
         # an accidental OPEN would be dangerous. We therefore aggregate per
         # (coin, action) and preserve action on emission.
         per_key: Dict[tuple[str, str], Dict[str, object]] = {}
+        coin_order: List[str] = []
 
         for t in trades:
             coin = t.coin
+            if coin not in coin_order:
+                coin_order.append(coin)
             action = str(getattr(t, "action", "") or "")
             if action not in (
                 TradeAction.OPEN_LONG,
@@ -149,33 +152,47 @@ class TradeBatcher:
         now_ms = int(time.time() * 1000)
         out: List[MonitoredTrade] = []
 
-        for (coin, action), entry in per_key.items():
-            total_size = float(entry["sum_size"])
-            if total_size <= 0:
-                continue
+        # Stronger guarantee: for each coin, emit CLOSEs before OPENs (reduces risk of flipping/overlap).
+        priority = {
+            TradeAction.CLOSE_LONG: 0,
+            TradeAction.CLOSE_SHORT: 0,
+            TradeAction.OPEN_LONG: 1,
+            TradeAction.OPEN_SHORT: 1,
+        }
 
-            # Preserve side semantics for downstream execution.
-            if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT):
-                side = "B"
-            else:
-                side = "A"
+        for coin in coin_order:
+            actions = [a for (c, a) in per_key.keys() if c == coin]
+            actions.sort(key=lambda a: priority.get(a, 9))
+            for action in actions:
+                entry = per_key.get((coin, action))
+                if not entry:
+                    continue
+                total_size = float(entry["sum_size"])
+                if total_size <= 0:
+                    continue
 
-            last: MonitoredTrade = entry["last"]  # type: ignore[assignment]
-            leverage = int(entry["max_leverage"])
-            direction = "long" if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG) else "short"
+                # Preserve side semantics for downstream execution.
+                if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_SHORT):
+                    side = "B"
+                else:
+                    side = "A"
 
-            out.append(
-                MonitoredTrade(
-                    action=action,
-                    coin=coin,
-                    size=total_size,
-                    price=float(getattr(last, "price", 0) or 0),
-                    leverage=leverage,
-                    timestamp=now_ms,
-                    tx_hash=f"batch:{now_ms}:{coin}:{action}",
-                    direction=direction,
-                    side=side,
+                last: MonitoredTrade = entry["last"]  # type: ignore[assignment]
+                leverage = int(entry["max_leverage"])
+                direction = "long" if action in (TradeAction.OPEN_LONG, TradeAction.CLOSE_LONG) else "short"
+
+                out.append(
+                    MonitoredTrade(
+                        action=action,
+                        coin=coin,
+                        size=total_size,
+                        price=float(getattr(last, "price", 0) or 0),
+                        leverage=leverage,
+                        timestamp=now_ms,
+                        tx_hash=f"batch:{now_ms}:{coin}:{action}",
+                        direction=direction,
+                        side=side,
+                    )
                 )
-            )
 
         return out

@@ -1256,6 +1256,18 @@ class HyperliquidCopyTrader:
         if self.position_manager:
             await self.position_manager.update_positions()
 
+        # Stronger guarantee: process CLOSEs before OPENs per coin (reduces flip overlap).
+        try:
+            priority = {
+                TradeAction.CLOSE_LONG: 0,
+                TradeAction.CLOSE_SHORT: 0,
+                TradeAction.OPEN_LONG: 1,
+                TradeAction.OPEN_SHORT: 1,
+            }
+            trades = sorted(trades, key=lambda t: (str(getattr(t, 'coin', '') or ''), priority.get(getattr(t, 'action', ''), 9)))
+        except Exception:
+            pass
+
         for trade in trades:
             await self._handle_new_trade(trade, copy_config)
 
