@@ -45,6 +45,8 @@ def setup_logging(config: Dict[str, Any]):
     Args:
         config: 日志配置字典
     """
+    from logging.handlers import TimedRotatingFileHandler
+    
     log_config = config.get('logging', {})
     level = getattr(logging, log_config.get('level', 'INFO').upper())
     log_file = log_config.get('file', 'logs/copy_trader.log')
@@ -52,12 +54,24 @@ def setup_logging(config: Dict[str, Any]):
     # 创建日志目录
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
+    # 创建按天轮换的文件处理器，保留7天
+    file_handler = TimedRotatingFileHandler(
+        log_file,
+        when='midnight',  # 每天午夜轮换
+        interval=1,       # 每1天
+        backupCount=7,    # 保留7天的备份
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    )
+
     # 配置日志
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
+            file_handler,
             logging.StreamHandler()
         ]
     )

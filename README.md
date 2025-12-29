@@ -4,6 +4,7 @@
 
 ## 功能特性
 
+### 核心功能
 - 🔍 **实时监控**: 监控指定地址的链上交易
 - 🤖 **自动跟单**: 根据配置比例自动复制交易
 - ⚡ **低延迟**: 使用Hyperliquid的高性能API
@@ -11,6 +12,13 @@
 - 🛡️ **风险控制**: 内置止损和最大仓位限制
 - 📊 **状态监控**: 实时显示仓位和盈亏情况
 - 🔧 **灵活配置**: 支持环境变量和配置文件两种配置方式
+
+### 运维工具 (v1.1.0新增)
+- 📈 **实时监控面板**: 可视化显示系统状态和仓位比例
+- 📊 **交易统计报表**: 日报/周报/月报,详细分析交易表现
+- 🏥 **健康检查告警**: 自动检测异常并通过Telegram告警
+- 🚀 **一键部署更新**: 简化代码更新和服务重启流程
+- 🎯 **智能日志过滤**: 减少重复日志,提高可读性
 
 ## 安装
 
@@ -165,6 +173,64 @@ TELEGRAM_CHAT_ID=your_chat_id
 - 程序会解析交易所返回结构中的 `statuses[].error`：有 error 会记为失败并输出 `Trade failed(...)`，避免“提示成功但实际拒单”。
 - 部分币种合约数量只能是整数（例如 `szDecimals=0`）。程序会按 `szDecimals` 向下取整后再下单；如果日志仍出现 `Order has invalid size.`，优先检查该币种 `szDecimals` 是否正确缓存/刷新。
 
+## 运维工具使用
+
+### 实时监控面板
+
+查看系统实时状态、仓位比例准确度:
+
+```bash
+# 完整模式
+python scripts/monitor_dashboard.py
+
+# 紧凑模式(适合终端)
+python scripts/monitor_dashboard.py --compact --interval 5
+```
+
+### 交易统计报表
+
+生成交易统计和性能分析:
+
+```bash
+# 今日报表
+python scripts/trading_report.py --period today
+
+# 周报
+python scripts/trading_report.py --period week
+
+# 自定义时间范围
+python scripts/trading_report.py --custom 2025-12-20 2025-12-27
+```
+
+### 健康检查
+
+检查系统健康状态,异常时发送告警:
+
+```bash
+# 单次检查
+python scripts/health_check.py
+
+# 持续监控(每10分钟检查,异常时告警)
+python scripts/health_check.py --alert --continuous --interval 10
+```
+
+### 一键部署更新
+
+从本地快速部署到服务器:
+
+```bash
+# 完整部署(同步代码+重启服务)
+./scripts/deploy_update.sh
+
+# 只查看操作,不实际执行
+./scripts/deploy_update.sh --dry-run
+
+# 只更新环境变量
+./scripts/deploy_update.sh --env-only
+```
+
+详细使用说明请查看 [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md)
+
 ## 安全注意事项
 
 - 从极小的跟单比例开始测试 (0.001 = 0.1%)
@@ -172,3 +238,12 @@ TELEGRAM_CHAT_ID=your_chat_id
 - 监控账户风险，设置止损机制
 - 不要使用主钱包私钥，使用专门的交易钱包
 - 定期检查系统运行状态和交易记录
+
+## 相关文档
+
+- [快速开始指南](QUICK_START.md) - 新手入门
+- [环境变量配置](ENV_SETUP_GUIDE.md) - 详细配置说明
+- [跟单比例计算](COPY_RATIO_GUIDE.md) - 比例设置指南
+- [优化工具使用](OPTIMIZATION_GUIDE.md) - 运维工具详解
+- [服务器部署](SERVER_DEPLOY_GUIDE.md) - 服务器运维指南
+- [AI接手文档](AI_HANDOFF_PROMPT.md) - 开发者文档
