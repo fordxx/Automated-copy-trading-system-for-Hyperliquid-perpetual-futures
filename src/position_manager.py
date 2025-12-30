@@ -323,9 +323,12 @@ class PositionManager:
             # Use cached follower account state
             state = self._last_user_state
         else:
-            # Fetch leader account state
+            # Fetch leader account state (sync call, will be called from async context)
             try:
-                state = asyncio.run(asyncio.to_thread(self.info.user_state, address))
+                # Note: This is a blocking call. In production, caller should handle it properly.
+                # For now, we use a simple sync call since user_state is not async.
+                import time
+                state = self.info.user_state(address)
             except Exception as e:
                 logger.warning(f"Failed to fetch account value for {address}: {e}")
                 return None
