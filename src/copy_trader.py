@@ -3,6 +3,7 @@
 整合交易监控和仓位管理，实现自动跟单功能。
 """
 import asyncio
+from collections import deque
 import logging
 import signal
 import sys
@@ -86,6 +87,8 @@ class HyperliquidCopyTrader:
 
         # Centralized trade deduplication (shared between REST and WS monitors)
         self._processed_tx_hashes: set[str] = set()
+        self._processed_tx_order: deque[str] = deque()
+        self._inflight_tx_hashes: set[str] = set()
         self._dedup_lock = asyncio.Lock()
         self._max_dedup_set_size = _safe_get_env_int('MAX_DEDUP_SET_SIZE', 10000, min_val=100, max_val=100000)
 
@@ -491,20 +494,30 @@ class HyperliquidCopyTrader:
     async def _is_trade_processed(self, tx_hash: str) -> bool:
         """Check if a trade has already been processed (thread-safe)."""
         async with self._dedup_lock:
-            return tx_hash in self._processed_tx_hashes
+            return tx_hash in self._processed_tx_hashes or tx_hash in self._inflight_tx_hashes
 
     async def _mark_trade_processed(self, tx_hash: str) -> None:
         """Mark a trade as processed, with bounded set size (thread-safe)."""
         async with self._dedup_lock:
+            if tx_hash in self._processed_tx_hashes:
+                return
             self._processed_tx_hashes.add(tx_hash)
-            # Prune oldest entries if set grows too large (FIFO-like behavior)
-            if len(self._processed_tx_hashes) > self._max_dedup_set_size:
-                # Remove approximately 10% of oldest entries
-                to_remove = len(self._processed_tx_hashes) - int(self._max_dedup_set_size * 0.9)
-                # Convert to list, remove first N items, then recreate set
-                items = list(self._processed_tx_hashes)
-                self._processed_tx_hashes = set(items[to_remove:])
-                logger.debug(f"Pruned {to_remove} old tx_hashes from dedup set")
+            self._processed_tx_order.append(tx_hash)
+            # Prune oldest entries if set grows too large (true FIFO).
+            while len(self._processed_tx_order) > self._max_dedup_set_size:
+                old = self._processed_tx_order.popleft()
+                self._processed_tx_hashes.discard(old)
+            if tx_hash in self._inflight_tx_hashes:
+                self._inflight_tx_hashes.discard(tx_hash)
+
+    async def _mark_trade_inflight(self, tx_hash: str) -> None:
+        """Track a trade while it is being processed to avoid duplicate work."""
+        async with self._dedup_lock:
+            self._inflight_tx_hashes.add(tx_hash)
+
+    async def _clear_trade_inflight(self, tx_hash: str) -> None:
+        async with self._dedup_lock:
+            self._inflight_tx_hashes.discard(tx_hash)
 
     async def _notify_startup_config_summary(self) -> None:
         """Send a one-shot startup self-check summary to Telegram.
@@ -1291,9 +1304,9 @@ class HyperliquidCopyTrader:
 
             logger.info(f"⚡ Processing new trade: {trade}")
 
-            # Mark trade as processed early to prevent race conditions
+            # Track in-flight to prevent duplicates while executing.
             if tx_hash:
-                await self._mark_trade_processed(tx_hash)
+                await self._mark_trade_inflight(tx_hash)
 
             # 检查是否启用跟单
             if not copy_config.get('enabled', True):
@@ -1348,6 +1361,17 @@ class HyperliquidCopyTrader:
                     logger.info(f"ℹ️ Trade handled (status={st} reason={rsn}) in {response_time:.3f}s")
             else:
                 logger.info(f"ℹ️ Trade handled in {response_time:.3f}s")
+
+            # Mark as processed only after handling result (allow retry on errors).
+            if tx_hash:
+                if isinstance(exec_report, dict):
+                    status = exec_report.get("status")
+                    if status in ("submitted", "skipped"):
+                        await self._mark_trade_processed(tx_hash)
+                    elif status == "error":
+                        await self._clear_trade_inflight(tx_hash)
+                else:
+                    await self._mark_trade_processed(tx_hash)
 
             # 发送交易通知
             if self.notification_manager:
@@ -1405,6 +1429,9 @@ class HyperliquidCopyTrader:
                     "error",
                     f"处理交易失败: {trade.coin} {trade.action}\n错误: {str(e)}"
                 )
+        finally:
+            if tx_hash:
+                await self._clear_trade_inflight(tx_hash)
 
     async def _log_status(self):
         """记录当前状态。"""

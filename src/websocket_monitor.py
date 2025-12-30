@@ -3,6 +3,7 @@
 实时监控指定地址的交易，使用WebSocket推送实现零延迟。
 """
 import asyncio
+from collections import deque
 import logging
 import json
 import os
@@ -68,6 +69,8 @@ class WebSocketMonitor:
         # on first connection. After that, this will be updated to the latest trade timestamp.
         self.last_check_timestamp = 0
         self.processed_tx_hashes = set()
+        self._processed_tx_order: deque[str] = deque()
+        self._max_dedup_set_size = int(os.getenv('WS_DEDUP_SET_SIZE', '10000') or 10000)
         self.is_running = False
         self.snapshot_received = False
         self._ready_fired_for_connection = False
@@ -377,10 +380,16 @@ class WebSocketMonitor:
             if timestamp <= self.last_check_timestamp:
                 return
 
-            # 标记为已处理
-            self.processed_tx_hashes.add(tx_hash)
+            # 标记为已处理（FIFO上限）
+            if tx_hash not in self.processed_tx_hashes:
+                self.processed_tx_hashes.add(tx_hash)
+                self._processed_tx_order.append(tx_hash)
+                while len(self._processed_tx_order) > self._max_dedup_set_size:
+                    old = self._processed_tx_order.popleft()
+                    self.processed_tx_hashes.discard(old)
             self.stats['trades_detected'] += 1
             self.stats['last_trade_time'] = datetime.fromtimestamp(timestamp / 1000)
+            self.last_check_timestamp = max(self.last_check_timestamp, timestamp)
 
             # 解析交易动作
             from .trade_monitor import MonitoredTrade, TradeAction

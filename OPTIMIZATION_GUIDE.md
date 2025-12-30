@@ -84,7 +84,7 @@ Coin       Leader Size    Follower Size     Actual%   Expected%       Dev%
 ```bash
 # SSH到服务器并运行监控
 ssh -i /home/fordxx/perp-tools/LightsailDefaultKey-ap-northeast-2.pem ubuntu@3.38.98.169
-cd ~/copybot
+cd ~/copybot_release
 .venv/bin/python scripts/monitor_dashboard.py --compact --interval 10
 ```
 
@@ -174,7 +174,7 @@ Success Rate     : 87.72%
 
 ```bash
 # 每天早上8点生成日报并通过邮件发送
-0 8 * * * cd /home/ubuntu/copybot && .venv/bin/python scripts/trading_report.py --period today > /tmp/daily_report.txt 2>&1
+0 8 * * * cd /home/ubuntu/copybot_release && .venv/bin/python scripts/trading_report.py --period today > /tmp/daily_report.txt 2>&1
 ```
 
 ---
@@ -245,8 +245,8 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/copybot
-ExecStart=/home/ubuntu/copybot/.venv/bin/python /home/ubuntu/copybot/scripts/health_check.py --alert --continuous --interval 10
+WorkingDirectory=/home/ubuntu/copybot_release
+ExecStart=/home/ubuntu/copybot_release/.venv/bin/python /home/ubuntu/copybot_release/scripts/health_check.py --alert --continuous --interval 10
 Restart=always
 RestartSec=60
 
@@ -350,7 +350,7 @@ setup_smart_logging(logger, throttle_seconds=60)
   Copy Trader Deployment Script
 ==========================================
 
-[INFO] Target: ubuntu@3.38.98.169:~/copybot
+[INFO] Target: ubuntu@3.38.98.169:~/copybot_release
 
 [INFO] Checking prerequisites...
 [SUCCESS] Prerequisites check passed
@@ -371,7 +371,7 @@ scripts/health_check.py
 [SUCCESS] Deployment completed!
 
 [INFO] Tip: Monitor logs with:
-  ssh -i ... ubuntu@3.38.98.169 "cd ~/copybot && ./scripts/manage_copy_trader.sh tail app"
+  ssh -i ... ubuntu@3.38.98.169 "cd ~/copybot_release && ./scripts/manage_copy_trader.sh tail app"
 ```
 
 ---
@@ -398,7 +398,7 @@ python scripts/health_check.py
 ssh -i /home/fordxx/perp-tools/LightsailDefaultKey-ap-northeast-2.pem ubuntu@3.38.98.169
 
 # 查看状态
-cd ~/copybot && ./scripts/manage_copy_trader.sh status
+cd ~/copybot_release && ./scripts/manage_copy_trader.sh status
 
 # 运行监控面板
 .venv/bin/python scripts/monitor_dashboard.py --compact
@@ -433,7 +433,7 @@ cd /home/fordxx/perp-tools/copybot
 
 ```bash
 # 压缩归档旧日志
-cd ~/copybot/logs
+cd ~/copybot_release/logs
 gzip copy_trader.log.2025-12-20
 
 # 或者使用logrotate自动管理

@@ -26,7 +26,7 @@
 ```bash
 # 服务器上使用
 ssh ubuntu@3.38.98.169
-cd ~/copybot
+cd ~/copybot_release
 .venv/bin/python scripts/monitor_dashboard.py --compact --interval 5
 ```
 
@@ -227,7 +227,7 @@ python scripts/health_check.py --alert --continuous --interval 10
 ```bash
 # 1. 实时监控(推荐每天查看)
 ssh ubuntu@3.38.98.169
-cd ~/copybot
+cd ~/copybot_release
 .venv/bin/python scripts/monitor_dashboard.py --compact
 
 # 2. 查看今日报表
@@ -250,7 +250,7 @@ cd /home/fordxx/perp-tools/copybot
 ```bash
 # 在服务器上设置持续健康监控
 ssh ubuntu@3.38.98.169
-cd ~/copybot
+cd ~/copybot_release
 
 # 后台运行健康检查(每10分钟,异常时Telegram告警)
 nohup .venv/bin/python scripts/health_check.py --alert --continuous --interval 10 > /dev/null 2>&1 &
