@@ -37,7 +37,8 @@ trading_instances:
     
     # 跟单参数
     copy_trading:
-      copy_ratio: 0.1  # 10%
+      copy_mode: "position"  # "position"(按仓位比例) 或 "wallet"(按钱包余额比例)
+      copy_ratio: 0.1  # 10% (position模式使用)
       max_position_size: 10.0
       min_trade_size: 0.01
       max_leverage: 5
@@ -71,7 +72,8 @@ trading_instances:
     
     # 跟单参数
     copy_trading:
-      copy_ratio: 0.2  # 20%
+      copy_mode: "wallet"  # "position"(按仓位比例) 或 "wallet"(按钱包余额比例)
+      copy_ratio: 0.2  # 20% (position模式使用，wallet模式自动计算)
       max_position_size: 20.0
       min_trade_size: 0.01
       max_leverage: 3

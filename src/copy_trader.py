@@ -238,6 +238,9 @@ class HyperliquidCopyTrader:
         if 'copy_trading' not in config:
             config['copy_trading'] = {}
 
+        # Copy mode: "position" (根据仓位大小比例) 或 "wallet" (根据钱包余额比例)
+        config['copy_trading']['copy_mode'] = os.getenv('COPY_MODE',
+                                                       config['copy_trading'].get('copy_mode', 'position')).lower()
         config['copy_trading']['copy_ratio'] = float(os.getenv('COPY_RATIO',
                                                              config['copy_trading'].get('copy_ratio', 0.1)))
         config['copy_trading']['max_position_size'] = float(os.getenv('MAX_POSITION_SIZE',
@@ -1306,11 +1309,13 @@ class HyperliquidCopyTrader:
                 return
 
             # 获取跟单参数
+            copy_mode = copy_config.get('copy_mode', 'position')
             copy_ratio = copy_config.get('copy_ratio', 0.1)
             max_size = copy_config.get('max_position_size', 1.0)
             max_leverage = copy_config.get('max_leverage', 5)
             max_notional = copy_config.get('max_notional_per_trade_usd', 0.0)
             min_trade_size = copy_config.get('min_trade_size', 0.01)
+            leader_address = self.config.get('target_address')
 
             # 执行跟单
             exec_report = await self.position_manager.execute_copy_trade(
@@ -1320,6 +1325,8 @@ class HyperliquidCopyTrader:
                 max_leverage=max_leverage,
                 max_notional_per_trade_usd=max_notional,
                 min_trade_size=min_trade_size,
+                copy_mode=copy_mode,
+                leader_address=leader_address,
             )
 
             # 计算响应时间

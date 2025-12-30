@@ -13,9 +13,10 @@
 - 📊 **状态监控**: 实时显示仓位和盈亏情况
 - 🔧 **灵活配置**: 支持环境变量和配置文件两种配置方式
 
-### 高级功能 (v1.3.0新增)
-- 💼 **多钱包多Leader**: 使用不同钱包同时跟踪多个leader
-- 📝 **日志自动管理**: 自动轮换和清理，保留7天
+### 高级功能
+- 💼 **多钱包多Leader** (v1.4.0): 使用不同钱包同时跟踪多个leader
+- 📊 **双模式跟单** (v1.5.0): 支持固定比例和动态钱包比例两种模式
+- 📝 **日志自动管理** (v1.3.0): 自动轮换和清理，保留7天
 - 🔄 **进程自动重启**: 监控模式下自动恢复崩溃实例
 
 ### 运维工具 (v1.1.0新增)
@@ -54,7 +55,8 @@ nano .env
 - `TARGET_ADDRESS`: 要跟单的目标地址
 - `HYPERLIQUID_ACCOUNT_ADDRESS`: 你的Hyperliquid账户地址
 - `HYPERLIQUID_PRIVATE_KEY`: 你的私钥（保密！）
-- `COPY_RATIO`: 跟单比例（0.1 = 10%）
+- `COPY_MODE`: 跟单模式 (`position` 或 `wallet`，默认 `position`)
+- `COPY_RATIO`: 跟单比例（0.1 = 10%，position模式使用）
 - `TELEGRAM_BOT_TOKEN`: Telegram机器人令牌（可选）
 
 **常用可选环境变量（建议了解）：**
@@ -89,6 +91,7 @@ exclude_addresses:
 
 # 跟单配置
 copy_trading:
+  copy_mode: "position"  # "position"(固定比例) 或 "wallet"(动态钱包比例)
   copy_ratio: 0.1  # 跟单比例: 0.1 = 跟单目标交易大小的10%
   max_position_size: 1.0  # 最大单笔仓位大小限制
 
@@ -268,6 +271,7 @@ python scripts/run_multi_trader.py monitor # 监控模式（自动重启）
 
 - [快速开始指南](QUICK_START.md) - 新手入门
 - [多实例跟单指南](MULTI_INSTANCE_GUIDE.md) - 多钱包多Leader配置
+- [跟单模式指南](COPY_MODE_GUIDE.md) - Position vs Wallet模式详解
 - [环境变量配置](ENV_SETUP_GUIDE.md) - 详细配置说明
 - [跟单比例计算](COPY_RATIO_GUIDE.md) - 比例设置指南
 - [优化工具使用](OPTIMIZATION_GUIDE.md) - 运维工具详解

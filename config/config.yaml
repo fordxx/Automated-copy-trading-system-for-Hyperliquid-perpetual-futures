@@ -10,7 +10,14 @@ exclude_addresses:
 # 跟单配置
 copy_trading:
   enabled: true
-  copy_ratio: 0.1  # 跟单比例 (0.1 = 10% of target position)
+  # 跟单模式:
+  # - "position": 根据开仓位大小按比例跟单 (默认模式)
+  #   例: Leader开100U, copy_ratio=0.1, Follower开 10U
+  # - "wallet": 根据钱包余额比例跟单
+  #   例: Leader钱包 10000U, Follower钱包 1000U, 比例自动计算为 1000/10000=0.1
+  #   每次交易都会动态计算当前钱包比例，不受copy_ratio限制
+  copy_mode: "position"  # "position" 或 "wallet"
+  copy_ratio: 0.1  # 跟单比例 (position模式使用, 0.1 = 10% of target position)
   max_position_size: 1.0  # 最大仓位大小 (合约数量)
   min_trade_size: 0.01  # 最小交易大小
   max_leverage: 5  # 最大杠杆

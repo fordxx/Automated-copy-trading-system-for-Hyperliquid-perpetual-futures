@@ -310,12 +310,26 @@ class PositionManager:
 
         return {"status": "submitted", "closed": results, "errors": int(errors)}
 
-    def get_account_value_usd(self) -> Optional[float]:
-        """Return the latest account value (equity) in USD if available.
+    def get_account_value_usd(self, address: Optional[str] = None) -> Optional[float]:
+        """Return the account value (equity) in USD.
+
+        Args:
+            address: If provided, fetch the account value for this address.
+                    If None, use the cached user_state for the follower account.
 
         This comes from the cached user_state payload. We avoid extra REST calls here.
         """
-        state = self._last_user_state
+        if address is None:
+            # Use cached follower account state
+            state = self._last_user_state
+        else:
+            # Fetch leader account state
+            try:
+                state = asyncio.run(asyncio.to_thread(self.info.user_state, address))
+            except Exception as e:
+                logger.warning(f"Failed to fetch account value for {address}: {e}")
+                return None
+
         if not isinstance(state, dict):
             return None
 
@@ -372,8 +386,14 @@ class PositionManager:
         max_leverage: int = 5,
         max_notional_per_trade_usd: float = 0.0,
         min_trade_size: float = 0.01,
+        copy_mode: str = "position",
+        leader_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """执行跟单交易（极速开/平）。
+
+        Args:
+            copy_mode: "position" (根据仓位大小比例) 或 "wallet" (根据钱包余额比例)
+            leader_address: Leader地址，wallet模式下需要此参数获取其钱包余额
 
         策略：
         - 优先使用 fill 的 side(B=买/A=卖) 来决定方向。
@@ -387,7 +407,29 @@ class PositionManager:
         lock = self._get_coin_lock(coin)
         await lock.acquire()
         try:
-            requested_size = float(getattr(trade, 'size', 0) or 0) * float(copy_ratio)
+            # 根据copy_mode计算实际的copy_ratio
+            actual_copy_ratio = copy_ratio
+            if copy_mode == "wallet" and leader_address:
+                # 钱包模式：根据钱包余额比例计算
+                try:
+                    follower_balance = self.get_account_value_usd()
+                    leader_balance = self.get_account_value_usd(leader_address)
+                    
+                    if follower_balance and leader_balance and leader_balance > 0:
+                        actual_copy_ratio = follower_balance / leader_balance
+                        logger.info(
+                            f"💰 Wallet mode: Follower={follower_balance:.2f}U, "
+                            f"Leader={leader_balance:.2f}U, Ratio={actual_copy_ratio:.4f}"
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ Wallet mode failed (follower={follower_balance}, leader={leader_balance}), "
+                            f"fallback to position mode with ratio={copy_ratio}"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to calculate wallet ratio: {e}, using position mode ratio={copy_ratio}")
+            
+            requested_size = float(getattr(trade, 'size', 0) or 0) * float(actual_copy_ratio)
             copy_size_before_caps = float(requested_size)
             copy_size = float(requested_size)
 
