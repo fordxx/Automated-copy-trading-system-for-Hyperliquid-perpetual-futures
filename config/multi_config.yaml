@@ -1,0 +1,118 @@
+# Multi-Wallet Multi-Leader Configuration
+# 多钱包多Leader跟单配置
+
+# 全局配置
+global_settings:
+  # 是否使用测试网
+  use_testnet: false
+  
+  # 日志配置
+  logging:
+    level: INFO
+    base_dir: logs
+  
+  # Telegram通知配置（全局，所有实例共享）
+  telegram:
+    enabled: false
+    bot_token: ""  # 从 @BotFather 获取
+    chat_id: ""    # 从 @userinfobot 获取
+
+# 跟单实例配置列表
+# 每个实例独立运行，使用不同的钱包跟踪不同的leader
+trading_instances:
+  # 实例1: 跟踪Leader A
+  - name: "trader_1"
+    enabled: true
+    
+    # Leader配置
+    target_address: "0x0000000000000000000000000000000000000001"
+    exclude_addresses:
+      - "0xYourFollowerAddress1"  # 避免跟踪自己的交易
+    
+    # Follower钱包配置
+    hyperliquid:
+      account_address: "0xYourFollowerAddress1"
+      private_key: "0xYourPrivateKey1"
+      vault_address: ""  # 可选
+    
+    # 跟单参数
+    copy_trading:
+      copy_ratio: 0.1  # 10%
+      max_position_size: 10.0
+      min_trade_size: 0.01
+      max_leverage: 5
+    
+    # 风险控制
+    risk_management:
+      max_drawdown: 0.1
+      stop_loss_ratio: 0.05
+      take_profit_ratio: 0.1
+    
+    # 监控配置
+    monitoring:
+      poll_interval: 30
+      max_retries: 3
+      retry_delay: 5
+
+  # 实例2: 跟踪Leader B
+  - name: "trader_2"
+    enabled: true
+    
+    # Leader配置
+    target_address: "0x0000000000000000000000000000000000000002"
+    exclude_addresses:
+      - "0xYourFollowerAddress2"
+    
+    # Follower钱包配置
+    hyperliquid:
+      account_address: "0xYourFollowerAddress2"
+      private_key: "0xYourPrivateKey2"
+      vault_address: ""
+    
+    # 跟单参数
+    copy_trading:
+      copy_ratio: 0.2  # 20%
+      max_position_size: 20.0
+      min_trade_size: 0.01
+      max_leverage: 3
+    
+    # 风险控制
+    risk_management:
+      max_drawdown: 0.15
+      stop_loss_ratio: 0.08
+      take_profit_ratio: 0.15
+    
+    # 监控配置
+    monitoring:
+      poll_interval: 30
+      max_retries: 3
+      retry_delay: 5
+
+  # 实例3: 跟踪Leader C (示例，默认禁用)
+  - name: "trader_3"
+    enabled: false
+    
+    target_address: "0x0000000000000000000000000000000000000003"
+    exclude_addresses:
+      - "0xYourFollowerAddress3"
+    
+    hyperliquid:
+      account_address: "0xYourFollowerAddress3"
+      private_key: "0xYourPrivateKey3"
+      vault_address: ""
+    
+    copy_trading:
+      copy_ratio: 0.15
+      max_position_size: 15.0
+      min_trade_size: 0.01
+      max_leverage: 4
+    
+    risk_management:
+      max_drawdown: 0.12
+      stop_loss_ratio: 0.06
+      take_profit_ratio: 0.12
+    
+    monitoring:
+      poll_interval: 30
+      max_retries: 3
+      retry_delay: 5

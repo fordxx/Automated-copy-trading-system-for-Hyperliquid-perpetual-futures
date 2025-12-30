@@ -66,7 +66,7 @@ class HyperliquidCopyTrader:
     监控指定地址的交易并自动复制到自己的账户。
     """
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, config_dict: Optional[Dict[str, Any]] = None):
         # Load environment variables.
         # Use an explicit path so detached/background runs don't miss the repo-root .env.
         try:
@@ -75,7 +75,7 @@ class HyperliquidCopyTrader:
         except Exception:
             load_dotenv()
 
-        self.config = self._load_config(config_path)
+        self.config = self._load_config(config_path, config_dict)
         self.running = False
 
         # 初始化组件
@@ -188,12 +188,16 @@ class HyperliquidCopyTrader:
             )
         logger.info("✅ HyperliquidCopyTrader initialized")
 
-    def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
+    def _load_config(self, config_path: Optional[str] = None, config_dict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """加载配置文件，支持环境变量覆盖。"""
         config = {}
 
+        # 优先使用直接传入的配置字典（用于多实例模式）
+        if config_dict:
+            config = config_dict.copy()
+            logger.info("Loaded config from provided dictionary")
         # 如果提供了配置文件路径，先加载YAML配置
-        if config_path and os.path.exists(config_path):
+        elif config_path and os.path.exists(config_path):
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f) or {}
             logger.info(f"Loaded config from {config_path}")

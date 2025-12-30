@@ -13,6 +13,11 @@
 - 📊 **状态监控**: 实时显示仓位和盈亏情况
 - 🔧 **灵活配置**: 支持环境变量和配置文件两种配置方式
 
+### 高级功能 (v1.3.0新增)
+- 💼 **多钱包多Leader**: 使用不同钱包同时跟踪多个leader
+- 📝 **日志自动管理**: 自动轮换和清理，保留7天
+- 🔄 **进程自动重启**: 监控模式下自动恢复崩溃实例
+
 ### 运维工具 (v1.1.0新增)
 - 📈 **实时监控面板**: 可视化显示系统状态和仓位比例
 - 📊 **交易统计报表**: 日报/周报/月报,详细分析交易表现
@@ -231,6 +236,26 @@ python scripts/health_check.py --alert --continuous --interval 10
 
 详细使用说明请查看 [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md)
 
+## 多钱包多Leader跟单
+
+使用不同的钱包同时跟踪多个leader的交易：
+
+```bash
+# 配置多个实例
+cp config/multi_config.yaml config/my_multi.yaml
+nano config/my_multi.yaml
+
+# 使用管理脚本（推荐）
+./scripts/manage_multi_trader.sh
+
+# 或直接使用Python脚本
+python scripts/run_multi_trader.py start   # 启动所有
+python scripts/run_multi_trader.py status  # 查看状态
+python scripts/run_multi_trader.py monitor # 监控模式（自动重启）
+```
+
+详细使用说明请查看 [MULTI_INSTANCE_GUIDE.md](MULTI_INSTANCE_GUIDE.md)
+
 ## 安全注意事项
 
 - 从极小的跟单比例开始测试 (0.001 = 0.1%)
@@ -242,6 +267,7 @@ python scripts/health_check.py --alert --continuous --interval 10
 ## 相关文档
 
 - [快速开始指南](QUICK_START.md) - 新手入门
+- [多实例跟单指南](MULTI_INSTANCE_GUIDE.md) - 多钱包多Leader配置
 - [环境变量配置](ENV_SETUP_GUIDE.md) - 详细配置说明
 - [跟单比例计算](COPY_RATIO_GUIDE.md) - 比例设置指南
 - [优化工具使用](OPTIMIZATION_GUIDE.md) - 运维工具详解
