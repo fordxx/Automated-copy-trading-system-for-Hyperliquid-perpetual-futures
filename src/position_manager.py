@@ -425,12 +425,29 @@ class PositionManager:
                             f"Leader={leader_balance:.2f}U, Ratio={actual_copy_ratio:.4f}"
                         )
                     else:
-                        logger.warning(
-                            f"⚠️ Wallet mode failed (follower={follower_balance}, leader={leader_balance}), "
-                            f"fallback to position mode with ratio={copy_ratio}"
+                        # Wallet模式失败：跳过交易，不降级到Position模式
+                        logger.error(
+                            f"❌ Wallet mode failed (follower={follower_balance}, leader={leader_balance}). "
+                            f"Skipping trade to avoid incorrect position size. Check network or API status."
                         )
+                        return {
+                            "status": "skipped",
+                            "reason": f"wallet_mode_failed_follower={follower_balance}_leader={leader_balance}",
+                            "coin": coin,
+                            "action": str(getattr(trade, "action", "")),
+                        }
                 except Exception as e:
-                    logger.error(f"Failed to calculate wallet ratio: {e}, using position mode ratio={copy_ratio}")
+                    # Wallet模式异常：跳过交易
+                    logger.error(
+                        f"❌ Wallet mode error: {e}. Skipping trade to avoid incorrect position size."
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": f"wallet_mode_error_{type(e).__name__}",
+                        "coin": coin,
+                        "action": str(getattr(trade, "action", "")),
+                        "error": str(e),
+                    }
             
             requested_size = float(getattr(trade, 'size', 0) or 0) * float(actual_copy_ratio)
             copy_size_before_caps = float(requested_size)

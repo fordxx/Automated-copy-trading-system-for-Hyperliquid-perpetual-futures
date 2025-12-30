@@ -245,8 +245,9 @@ trading_instances:
 ⚠️ **可能触发rate limit**
 - 高频交易时可能增加API压力
 
-⚠️ **备用机制**
-- 如果无法获取Leader余额，会fallback到`copy_ratio`（Position模式）
+⚠️ **失败时跳过交易**
+- 如果无法获取Leader余额，该笔交易会被跳过（不执行）
+- 不会降级到Position模式，避免使用错误比例
 
 ⚠️ **实时余额依赖**
 - 如果Leader刚进行大额转账，可能影响比例计算准确性
@@ -259,13 +260,27 @@ trading_instances:
 
 如果Wallet模式无法获取Leader或Follower的账户余额：
 
-1. 系统会**自动降级**到Position模式
-2. 使用配置文件中的`copy_ratio`作为备用比例
-3. 记录警告日志：
+1. 系统会**跳过该笔交易**（不执行）
+2. 记录错误日志并说明原因
+3. **不会降级到Position模式**（避免使用错误的比例下单）
+4. 日志示例：
    ```
-   ⚠️ Wallet mode failed (follower=xxx, leader=xxx), 
-   fallback to position mode with ratio=0.1
+   ❌ Wallet mode failed (follower=None, leader=10000.00). 
+   Skipping trade to avoid incorrect position size. Check network or API status.
    ```
+
+**为什么不自动降级？**
+
+如果自动降级到Position模式，可能导致严重问题：
+- 示例：Follower账户100U，Leader账户10000U
+- Wallet模式正确比例：0.01 (1%)
+- 配置的copy_ratio：0.1 (10%)
+- 如果降级使用0.1，会导致下单金额放大10倍！⚠️
+
+**安全建议：**
+- Wallet模式下如果频繁失败，检查网络连接
+- 确保Leader地址正确且有余额
+- 考虑添加重试机制或切换到Position模式（手动）
 
 ### 日志示例
 
@@ -274,10 +289,24 @@ trading_instances:
 💰 Wallet mode: Follower=1000.00U, Leader=10000.00U, Ratio=0.1000
 ```
 
-**Wallet模式失败（降级到Position模式）：**
+**Wallet模式失败（跳过交易）：**
 ```
-⚠️ Wallet mode failed (follower=None, leader=10000.00), 
-fallback to position mode with ratio=0.1
+❌ Wallet mode failed (follower=None, leader=10000.00). 
+Skipping trade to avoid incorrect position size. Check network or API status.
+```
+
+**为什么跳过而不是降级？**
+```
+危险示例:
+  Follower账户: 100 USDC
+  Leader账户: 10,000 USDC
+  正确Wallet比例: 0.01 (1%)
+  配置的copy_ratio: 0.1 (10%)
+  
+  Leader开仓: 1000 USDC
+  
+  ✅ Wallet模式正确: 1000 × 0.01 = 10 USDC
+  ❌ 降级Position模式: 1000 × 0.1 = 100 USDC (超出账户！)
 ```
 
 ---
@@ -286,10 +315,10 @@ fallback to position mode with ratio=0.1
 
 ### Q1: Wallet模式下，copy_ratio还有用吗？
 
-**A:** 有用！它作为**备用值**：
-- 当无法获取Leader钱包余额时使用
-- 作为初始配置的参考值
-- 建议设置为一个合理的安全值（如0.1）
+**A:** 不再使用作为备用值。
+- Wallet模式失败时会**跳过交易**，不会使用copy_ratio
+- copy_ratio仅在Position模式下使用
+- 建议：Wallet模式下可以设置为0，明确区分模式
 
 ### Q2: 我应该选择哪种模式？
 
