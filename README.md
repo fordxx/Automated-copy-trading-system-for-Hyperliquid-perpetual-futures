@@ -270,7 +270,8 @@ python scripts/run_multi_trader.py monitor # 监控模式（自动重启）
 ## 相关文档
 
 - [快速开始指南](QUICK_START.md) - 新手入门
-- [多实例跟单指南](MULTI_INSTANCE_GUIDE.md) - 多钱包多Leader配置
+- [多钱包快速参考](MULTI_WALLET_QUICK_START.md) - 1分钟上手多钱包
+- [多实例跟单指南](MULTI_INSTANCE_GUIDE.md) - 多钱包多Leader详细配置
 - [跟单模式指南](COPY_MODE_GUIDE.md) - Position vs Wallet模式详解
 - [环境变量配置](ENV_SETUP_GUIDE.md) - 详细配置说明
 - [跟单比例计算](COPY_RATIO_GUIDE.md) - 比例设置指南
