@@ -40,6 +40,7 @@ LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DRY_RUN=false
 NO_RESTART=false
 ENV_ONLY=false
+RSYNC_DELETE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -55,9 +56,13 @@ while [[ $# -gt 0 ]]; do
             ENV_ONLY=true
             shift
             ;;
+        --delete)
+            RSYNC_DELETE=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--dry-run] [--no-restart] [--env-only]"
+            echo "Usage: $0 [--dry-run] [--no-restart] [--env-only] [--delete]"
             exit 1
             ;;
     esac
@@ -156,15 +161,26 @@ backup_remote_env() {
 sync_code() {
     log_info "Syncing code to server..."
 
-    local rsync_cmd="rsync -avz --delete \
+    local delete_flag=""
+    if $RSYNC_DELETE; then
+        delete_flag="--delete"
+    fi
+
+    # NOTE:
+    # - Default intentionally does NOT sync `.env` and `config/my_multi.yaml` to avoid clobbering server secrets/config.
+    # - Use `--env-only` to upload `.env` explicitly.
+    local rsync_cmd="rsync -avz $delete_flag \
+        --exclude='.env' \
+        --exclude='.env.*' \
         --exclude='.venv' \
+        --exclude='venv' \
         --exclude='__pycache__' \
         --exclude='.pytest_cache' \
         --exclude='.git' \
-        --exclude='logs/*.log' \
-        --exclude='logs/*.pid' \
-        --exclude='logs/*.lock' \
+        --exclude='logs' \
+        --exclude='config/my_multi.yaml' \
         --exclude='*.pyc' \
+        --exclude='*.log' \
         --exclude='.claude' \
         -e \"ssh -i $SSH_KEY\" \
         \"$LOCAL_DIR/\" \
@@ -173,6 +189,8 @@ sync_code() {
     if $DRY_RUN; then
         echo -e "${YELLOW}[DRY-RUN]${NC} Would execute: $rsync_cmd"
     else
+        # Best-effort backup for remote `.env` before we sync code (even though we don't overwrite it by default).
+        ssh_cmd "cd $REMOTE_DIR && [ -f .env ] && cp .env .env.backup.\$(date +%Y%m%d_%H%M%S) || true"
         eval "$rsync_cmd"
         log_success "Code synced successfully"
     fi
