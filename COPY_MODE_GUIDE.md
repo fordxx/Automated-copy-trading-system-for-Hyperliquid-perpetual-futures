@@ -168,7 +168,7 @@ copy_trading:
 # Hyperliquid 配置
 hyperliquid:
   account_address: "0xYourFollowerAddress"
-  private_key: "0xYourPrivateKey"
+  private_key: "__FROM_ENV__"
   use_testnet: false
 ```
 
@@ -183,7 +183,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xFollowerAddress1"
-      private_key: "0xPrivateKey1"
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "position"
@@ -198,13 +198,23 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xFollowerAddress2"
-      private_key: "0xPrivateKey2"
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "wallet"
       copy_ratio: 0.1  # 作为备用值
       max_position_size: 2.0
       max_leverage: 3
+```
+
+配套的 `.env`：
+```bash
+# 单实例：使用统一变量
+HYPERLIQUID_PRIVATE_KEY=0x...
+
+# 多实例：按实例名生成变量名（name 大写，非字母数字替换成 _）
+HYPERLIQUID_PRIVATE_KEY_TRADER_POSITION=0x...
+HYPERLIQUID_PRIVATE_KEY_TRADER_WALLET=0x...
 ```
 
 ---

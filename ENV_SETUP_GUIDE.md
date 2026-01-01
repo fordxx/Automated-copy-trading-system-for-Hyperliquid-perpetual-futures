@@ -27,6 +27,25 @@ HYPERLIQUID_PRIVATE_KEY=0x你的私钥_保持绝对安全
 HYPERLIQUID_ENV=mainnet
 ```
 
+## 多实例（multi-trader）私钥推荐配置（方案A）
+
+多实例不要把私钥写进 `config/my_multi.yaml`，而是放到 `.env`，按实例名提供：
+
+```bash
+# 规则：实例 name 转大写，非字母数字替换为 _
+# 例：实例 name=trader_1
+HYPERLIQUID_PRIVATE_KEY_TRADER_1=0x你的私钥
+
+# 例：实例 name=trader_wallet_508f
+HYPERLIQUID_PRIVATE_KEY_TRADER_WALLET_508F=0x你的私钥
+```
+
+校验（会检查所有 enabled 实例对应的私钥 env 是否存在且格式正确）：
+
+```bash
+./scripts/validate_env.sh --multi --config config/my_multi.yaml
+```
+
 #### 可选配置：
 ```bash
 # 如果你也交易Hyperliquid，避免复制自己的交易

@@ -45,6 +45,10 @@ Thumbs.db
 logs/
 *.log
 
+# Local ops scripts / keys (do not commit)
+check_server_status.sh
+*.pem
+
 # Temporary files
 *.tmp
 *.temp

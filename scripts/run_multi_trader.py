@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List
 import multiprocessing as mp
 import yaml
+from dotenv import load_dotenv, dotenv_values
 
 # 添加项目根目录到 Python 路径
 project_root = Path(__file__).parent.parent
@@ -54,6 +55,15 @@ class MultiInstanceManager:
             import setproctitle
             setproctitle.setproctitle(f"copybot-{instance_name}")
         except ImportError:
+            pass
+
+        # Load repo-root .env so per-instance secrets can be provided via environment variables
+        # instead of storing private keys in YAML.
+        # Best-effort: make .env values available to this subprocess.
+        # We still read directly from dotenv_values() in _set_env_vars for robustness.
+        try:
+            load_dotenv(dotenv_path=project_root / ".env", override=False)
+        except Exception:
             pass
         
         try:
@@ -111,23 +121,73 @@ class MultiInstanceManager:
         merged['hyperliquid']['use_testnet'] = self.config['global_settings'].get('use_testnet', False)
         
         return merged
+
+    @staticmethod
+    def _instance_env_suffix(instance_name: str) -> str:
+        """Normalize instance name for environment variable suffixes."""
+        import re
+
+        raw = str(instance_name or "").strip().upper()
+        # Replace non-alnum with underscores (e.g. trader-1 -> TRADER_1)
+        raw = re.sub(r"[^A-Z0-9]+", "_", raw)
+        raw = raw.strip("_")
+        return raw or "INSTANCE"
     
     def _set_env_vars(self, instance_config: dict, instance_name: str):
         """为实例设置环境变量"""
         # 设置实例特定的环境变量
+        suffix = self._instance_env_suffix(instance_name)
         os.environ[f'INSTANCE_NAME'] = instance_name
-        os.environ['TARGET_ADDRESS'] = instance_config['target_address']
-        os.environ['HYPERLIQUID_ACCOUNT_ADDRESS'] = instance_config['hyperliquid']['account_address']
-        os.environ['HYPERLIQUID_PRIVATE_KEY'] = instance_config['hyperliquid']['private_key']
+        os.environ['TARGET_ADDRESS'] = str(instance_config['target_address'])
+        os.environ['HYPERLIQUID_ACCOUNT_ADDRESS'] = str(instance_config['hyperliquid']['account_address'])
+
+        # Prefer per-instance private key from env:
+        #   HYPERLIQUID_PRIVATE_KEY_<INSTANCE_NAME>
+        # This avoids storing secrets in YAML configs.
+        env_key = f"HYPERLIQUID_PRIVATE_KEY_{suffix}"
+        private_key = os.getenv(env_key)
+        if not private_key:
+            try:
+                dotenv_kv = dotenv_values(project_root / ".env")
+                private_key = str(dotenv_kv.get(env_key) or "")
+            except Exception:
+                private_key = ""
+        if not private_key:
+            # Backward-compatible fallback: single-instance key.
+            private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY") or ""
+        if not private_key:
+            private_key = instance_config['hyperliquid'].get('private_key', '')
+
+        # Fail fast with a helpful error if the key isn't usable.
+        if not isinstance(private_key, str) or not private_key.startswith("0x") or len(private_key) != 66:
+            raise ValueError(
+                f"Missing/invalid private key for instance '{instance_name}'. "
+                f"Set {env_key} in .env (recommended) or provide hyperliquid.private_key in the instance config."
+            )
+        os.environ['HYPERLIQUID_PRIVATE_KEY'] = private_key
+
+        # Ensure instance config is not accidentally overridden by global .env values:
+        # CopyTrader always applies env-overrides, so we inject per-instance env vars here.
+        copy_cfg = instance_config.get("copy_trading", {}) or {}
+        os.environ["COPY_MODE"] = str(copy_cfg.get("copy_mode", "position") or "position")
+        os.environ["COPY_RATIO"] = str(copy_cfg.get("copy_ratio", 0.1))
+        os.environ["MAX_POSITION_SIZE"] = str(copy_cfg.get("max_position_size", 1.0))
+        os.environ["MIN_TRADE_SIZE"] = str(copy_cfg.get("min_trade_size", 0.01))
+        os.environ["MAX_LEVERAGE"] = str(copy_cfg.get("max_leverage", 5))
+        os.environ["MAX_NOTIONAL_PER_TRADE_USD"] = str(copy_cfg.get("max_notional_per_trade_usd", 0.0))
+
+        # Exclude addresses: env expects comma-separated string.
+        exclude = instance_config.get("exclude_addresses", []) or []
+        if isinstance(exclude, list):
+            os.environ["EXCLUDE_ADDRESSES"] = ",".join(str(a).strip() for a in exclude if str(a).strip())
+        else:
+            os.environ["EXCLUDE_ADDRESSES"] = str(exclude)
+
+        # Network selection: enforce per-instance consistent setting.
+        os.environ["HYPERLIQUID_ENV"] = "testnet" if bool(self.config["global_settings"].get("use_testnet")) else "mainnet"
         
         if instance_config['hyperliquid'].get('vault_address'):
             os.environ['HYPERLIQUID_VAULT_ADDRESS'] = instance_config['hyperliquid']['vault_address']
-        
-        os.environ['COPY_RATIO'] = str(instance_config['copy_trading']['copy_ratio'])
-        os.environ['MAX_POSITION_SIZE'] = str(instance_config['copy_trading']['max_position_size'])
-        
-        if self.config['global_settings'].get('use_testnet'):
-            os.environ['HYPERLIQUID_ENV'] = 'testnet'
     
     def start_instance(self, instance_name: str, instance_config: dict):
         """启动单个实例"""

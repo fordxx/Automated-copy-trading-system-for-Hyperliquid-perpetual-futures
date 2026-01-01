@@ -597,9 +597,37 @@ class HyperliquidCopyTrader:
                         continue
 
                     copy_cfg = self.config.get("copy_trading", {}) or {}
+                    copy_mode = str(copy_cfg.get("copy_mode", "position") or "position").strip().lower()
                     copy_ratio = float(copy_cfg.get("copy_ratio", 0.1) or 0.1)
                     min_trade_size = float(copy_cfg.get("min_trade_size", 0.01) or 0.01)
                     max_notional = float(copy_cfg.get("max_notional_per_trade_usd", 0.0) or 0.0)
+
+                    # Wallet mode: position-sync should target the dynamic wallet ratio,
+                    # not the static configured copy_ratio.
+                    if copy_mode == "wallet":
+                        try:
+                            follower_balance = await self.position_manager.get_account_value_usd_async()
+                            leader_balance = await self.position_manager.get_account_value_usd_async(leader_address)
+                            if follower_balance and leader_balance and float(leader_balance) > 0:
+                                copy_ratio = float(follower_balance) / float(leader_balance)
+                                logger.info(
+                                    "💰 Position sync wallet ratio: follower=%.2fU leader=%.2fU ratio=%.4f",
+                                    float(follower_balance),
+                                    float(leader_balance),
+                                    float(copy_ratio),
+                                )
+                            else:
+                                logger.warning(
+                                    "💰 Position sync skipped (wallet mode balance unavailable): follower=%s leader=%s",
+                                    follower_balance,
+                                    leader_balance,
+                                )
+                                await asyncio.sleep(float(self._position_sync_interval_s))
+                                continue
+                        except Exception as e:
+                            logger.warning(f"💰 Position sync skipped (wallet mode error): {e}")
+                            await asyncio.sleep(float(self._position_sync_interval_s))
+                            continue
 
                     # Default leverage for sync opens: env override, otherwise bounded by MAX_LEVERAGE.
                     max_lev = int(copy_cfg.get("max_leverage", 5) or 5)
@@ -926,7 +954,17 @@ class HyperliquidCopyTrader:
                 if ts < since_ms:
                     continue
 
-                txh = str(fill.get('hash', '') or '')
+                raw_hash = fill.get('hash') or fill.get('txHash') or ''
+                if not isinstance(raw_hash, str):
+                    raw_hash = str(raw_hash)
+                tid = fill.get('tid', None)
+                if tid is not None and raw_hash:
+                    txh = f"{raw_hash}:{tid}"
+                elif tid is not None:
+                    txh = f"tid:{tid}"
+                else:
+                    txh = raw_hash
+
                 if not txh or txh in processed:
                     continue
 

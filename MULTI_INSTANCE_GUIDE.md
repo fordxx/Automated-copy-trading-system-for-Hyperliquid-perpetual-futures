@@ -60,7 +60,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xYourAddress1..."  # 你的钱包1
-      private_key: "0xYourPrivateKey1..."   # 钱包1私钥
+      private_key: "__FROM_ENV__"           # 从 .env 读取（HYPERLIQUID_PRIVATE_KEY_TRADER_1）
     
     copy_trading:
       copy_mode: "position"  # 固定比例模式
@@ -75,7 +75,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xYourAddress2..."  # 你的钱包2
-      private_key: "0xYourPrivateKey2..."   # 钱包2私钥
+      private_key: "__FROM_ENV__"           # 从 .env 读取（HYPERLIQUID_PRIVATE_KEY_TRADER_2）
     
     copy_trading:
       copy_mode: "wallet"    # 钱包比例模式
@@ -159,7 +159,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xABCD...WalletA"
-      private_key: "0xKEY_A..."
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "position"
@@ -175,7 +175,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xEFGH...WalletB"
-      private_key: "0xKEY_B..."
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "wallet"     # 钱包比例自动调整
@@ -191,7 +191,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xIJKL...WalletC"
-      private_key: "0xKEY_C..."
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "position"
@@ -211,7 +211,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xWALLET_1"
-      private_key: "0xKEY_1"
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "position"
@@ -230,7 +230,7 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xWALLET_2"
-      private_key: "0xKEY_2"
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "position"
@@ -433,7 +433,7 @@ nano config/my_multi.yaml
   target_address: "0xNewLeader..."
   hyperliquid:
     account_address: "0xNewWallet..."
-    private_key: "0xNewKey..."
+    private_key: "__FROM_ENV__"
   copy_trading:
     copy_mode: "position"
     copy_ratio: 0.1

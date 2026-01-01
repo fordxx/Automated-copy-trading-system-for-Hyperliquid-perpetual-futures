@@ -121,12 +121,17 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xYourWallet1"
-      private_key: "0xYourKey1"
+      private_key: "__FROM_ENV__"
     
     copy_trading:
       copy_mode: "position"
       copy_ratio: 0.1
       max_position_size: 5.0
+```
+
+配套的 `.env`（按实例名提供私钥）：
+```bash
+HYPERLIQUID_PRIVATE_KEY_TRADER_1=0x...
 ```
 
 ### 2. 启动

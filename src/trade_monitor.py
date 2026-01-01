@@ -133,7 +133,10 @@ class TradeMonitor:
                 # 使用缓存数据，过滤出新的交易
                 new_trades = []
                 for trade in self._recent_trades_cache:
-                    if trade.timestamp > self.last_check_timestamp and trade.tx_hash not in self.processed_tx_hashes:
+                    # NOTE: Hyperliquid can emit multiple fills with the exact same millisecond
+                    # timestamp (and even the same tx hash). Use >= and rely on the per-fill
+                    # dedup key to avoid missing same-timestamp fills.
+                    if trade.timestamp >= self.last_check_timestamp and trade.tx_hash not in self.processed_tx_hashes:
                         new_trades.append(trade)
                         self.processed_tx_hashes.add(trade.tx_hash)
                 
@@ -166,7 +169,7 @@ class TradeMonitor:
                     all_recent_trades.append(trade)
                     
                     # 检查是否是新交易
-                    if trade.timestamp > self.last_check_timestamp and trade.tx_hash not in self.processed_tx_hashes:
+                    if trade.timestamp >= self.last_check_timestamp and trade.tx_hash not in self.processed_tx_hashes:
                         new_trades.append(trade)
                         self.processed_tx_hashes.add(trade.tx_hash)
 
@@ -241,7 +244,16 @@ class TradeMonitor:
             size = float(fill.get("sz", 0))
             price = float(fill.get("px", 0))
             timestamp = int(fill.get("time", 0))
-            tx_hash = fill.get("hash", "")
+            raw_hash = str(fill.get("hash", "") or "")
+            tid = fill.get("tid", None)
+            # IMPORTANT: `hash` is NOT unique per fill; one order can produce many fills
+            # that share the same hash. Use (hash, tid) when possible.
+            if tid is not None and raw_hash:
+                tx_hash = f"{raw_hash}:{tid}"
+            elif tid is not None:
+                tx_hash = f"tid:{tid}"
+            else:
+                tx_hash = raw_hash
             side = fill.get("side", "")  # "B" for buy, "A" for sell
             leverage = int(fill.get("leverage", 1))
 

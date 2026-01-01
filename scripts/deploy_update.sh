@@ -9,7 +9,7 @@
 # 4. 显示最新日志
 #
 # 使用方法:
-#   ./scripts/deploy_update.sh                    # 部署到默认服务器
+#   ./scripts/deploy_update.sh                    # 部署到指定服务器（通过环境变量配置）
 #   ./scripts/deploy_update.sh --dry-run          # 只显示将要执行的操作,不实际执行
 #   ./scripts/deploy_update.sh --no-restart       # 只同步代码,不重启
 #   ./scripts/deploy_update.sh --env-only         # 只同步.env文件
@@ -23,11 +23,17 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# 配置
-SERVER_IP="3.38.98.169"
-SERVER_USER="ubuntu"
-SSH_KEY="/home/fordxx/perp-tools/LightsailDefaultKey-ap-northeast-2.pem"
-REMOTE_DIR="~/copybot"
+# 配置（允许用环境变量覆盖，避免硬编码本机路径/服务器信息）
+# - COPYBOT_SERVER_IP: 服务器 IP
+# - COPYBOT_SERVER_USER: 服务器用户（默认 ubuntu）
+# - COPYBOT_SSH_KEY: SSH 私钥路径
+# - COPYBOT_REMOTE_DIR: 远程部署目录
+# - COPYBOT_MULTI_CONFIG: 多实例配置路径（默认 config/my_multi.yaml）
+SERVER_IP="${COPYBOT_SERVER_IP:-}"
+SERVER_USER="${COPYBOT_SERVER_USER:-ubuntu}"
+SSH_KEY="${COPYBOT_SSH_KEY:-}"
+REMOTE_DIR="${COPYBOT_REMOTE_DIR:-~/copybot_release}"
+MULTI_CONFIG="${COPYBOT_MULTI_CONFIG:-config/my_multi.yaml}"
 LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # 参数解析
@@ -104,6 +110,16 @@ ssh_cmd() {
 
 check_prerequisites() {
     log_info "Checking prerequisites..."
+
+    if [[ -z "${SERVER_IP:-}" ]]; then
+        log_error "Missing server IP: set COPYBOT_SERVER_IP"
+        exit 1
+    fi
+
+    if [[ -z "${SSH_KEY:-}" ]]; then
+        log_error "Missing SSH key path: set COPYBOT_SSH_KEY"
+        exit 1
+    fi
 
     # 检查SSH密钥
     if [ ! -f "$SSH_KEY" ]; then
@@ -193,7 +209,12 @@ restart_service() {
         return 0
     fi
 
-    ssh_cmd "cd $REMOTE_DIR && ./scripts/manage_copy_trader.sh restart"
+    # Prefer multi-trader restart when the config exists on remote.
+    if ssh_cmd "cd $REMOTE_DIR && test -f \"$MULTI_CONFIG\" && test -x ./scripts/manage_multi_trader.sh"; then
+        ssh_cmd "cd $REMOTE_DIR && ./scripts/manage_multi_trader.sh restart --config \"$MULTI_CONFIG\""
+    else
+        ssh_cmd "cd $REMOTE_DIR && ./scripts/manage_copy_trader.sh restart"
+    fi
     log_success "Service restarted"
 
     # 等待服务启动
@@ -208,7 +229,11 @@ check_service_status() {
         return 0
     fi
 
-    ssh_cmd "cd $REMOTE_DIR && ./scripts/manage_copy_trader.sh status"
+    if ssh_cmd "cd $REMOTE_DIR && test -f \"$MULTI_CONFIG\" && test -x ./scripts/manage_multi_trader.sh"; then
+        ssh_cmd "cd $REMOTE_DIR && ./scripts/manage_multi_trader.sh status --config \"$MULTI_CONFIG\""
+    else
+        ssh_cmd "cd $REMOTE_DIR && ./scripts/manage_copy_trader.sh status"
+    fi
 }
 
 show_recent_logs() {
@@ -270,7 +295,7 @@ main() {
 
     if ! $DRY_RUN && ! $NO_RESTART; then
         log_info "Tip: Monitor logs with:"
-        echo "  ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP \"cd $REMOTE_DIR && ./scripts/manage_copy_trader.sh tail app\""
+        echo "  ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP \"cd $REMOTE_DIR && ./scripts/manage_multi_trader.sh tail\""
     fi
 
     echo ""

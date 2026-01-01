@@ -32,7 +32,9 @@ trading_instances:
     # Follower钱包配置
     hyperliquid:
       account_address: "0xYourFollowerAddress1"
-      private_key: "0xYourPrivateKey1"
+      # 推荐：不要把私钥写进 YAML；用 .env 提供：
+      #   HYPERLIQUID_PRIVATE_KEY_TRADER_1=0x...
+      private_key: "__FROM_ENV__"
       vault_address: ""  # 可选
     
     # 跟单参数
@@ -67,7 +69,9 @@ trading_instances:
     # Follower钱包配置
     hyperliquid:
       account_address: "0xYourFollowerAddress2"
-      private_key: "0xYourPrivateKey2"
+      # 推荐：不要把私钥写进 YAML；用 .env 提供：
+      #   HYPERLIQUID_PRIVATE_KEY_TRADER_2=0x...
+      private_key: "__FROM_ENV__"
       vault_address: ""
     
     # 跟单参数
@@ -100,7 +104,9 @@ trading_instances:
     
     hyperliquid:
       account_address: "0xYourFollowerAddress3"
-      private_key: "0xYourPrivateKey3"
+      # 推荐：不要把私钥写进 YAML；用 .env 提供：
+      #   HYPERLIQUID_PRIVATE_KEY_TRADER_3=0x...
+      private_key: "__FROM_ENV__"
       vault_address: ""
     
     copy_trading:

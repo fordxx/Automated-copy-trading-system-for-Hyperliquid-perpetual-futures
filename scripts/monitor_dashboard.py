@@ -44,7 +44,8 @@ class MonitorDashboard:
 
     def clear_screen(self):
         """清屏"""
-        os.system('clear' if os.name != 'nt' else 'cls')
+        # Avoid shell injection; use subprocess for clear-screen.
+        subprocess.run(['clear' if os.name != 'nt' else 'cls'], check=False)
 
     def get_positions(self, address):
         """获取仓位信息"""

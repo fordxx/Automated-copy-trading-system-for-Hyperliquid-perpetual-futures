@@ -320,22 +320,20 @@ class PositionManager:
         This comes from the cached user_state payload. We avoid extra REST calls here.
         """
         if address is None:
-            # Use cached follower account state
             state = self._last_user_state
         else:
-            # Fetch leader account state (sync call, will be called from async context)
             try:
-                # Note: This is a blocking call. In production, caller should handle it properly.
-                # For now, we use a simple sync call since user_state is not async.
-                import time
                 state = self.info.user_state(address)
             except Exception as e:
                 logger.warning(f"Failed to fetch account value for {address}: {e}")
                 return None
 
+        return self._parse_account_value_usd_from_state(state)
+
+    @staticmethod
+    def _parse_account_value_usd_from_state(state: Any) -> Optional[float]:
         if not isinstance(state, dict):
             return None
-
         # Common shapes seen in Hyperliquid user_state payloads.
         candidates = [
             ("marginSummary", "accountValue"),
@@ -362,6 +360,21 @@ class PositionManager:
                 continue
 
         return None
+
+    async def get_account_value_usd_async(self, address: Optional[str] = None) -> Optional[float]:
+        """Async wrapper for account value lookups.
+
+        - follower (address=None): uses cached user_state (no REST call)
+        - leader (address provided): fetches user_state off the event loop
+        """
+        if address is None:
+            return self._parse_account_value_usd_from_state(self._last_user_state)
+        try:
+            state = await asyncio.to_thread(self.info.user_state, address)
+        except Exception as e:
+            logger.warning(f"Failed to fetch account value for {address}: {e}")
+            return None
+        return self._parse_account_value_usd_from_state(state)
 
     def schedule_refresh(self, delay_s: float = 1.0):
         """Schedule a debounced positions refresh.
@@ -415,8 +428,8 @@ class PositionManager:
             if copy_mode == "wallet" and leader_address:
                 # 钱包模式：根据钱包余额比例计算
                 try:
-                    follower_balance = self.get_account_value_usd()
-                    leader_balance = self.get_account_value_usd(leader_address)
+                    follower_balance = await self.get_account_value_usd_async()
+                    leader_balance = await self.get_account_value_usd_async(leader_address)
                     
                     if follower_balance and leader_balance and leader_balance > 0:
                         actual_copy_ratio = follower_balance / leader_balance

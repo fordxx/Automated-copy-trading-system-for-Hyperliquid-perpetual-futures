@@ -25,8 +25,8 @@
 **使用方法**:
 ```bash
 # 服务器上使用
-ssh ubuntu@3.38.98.169
-cd ~/copybot_release
+ssh "$COPYBOT_SERVER_USER@$COPYBOT_SERVER_IP"
+cd "$COPYBOT_REMOTE_DIR"
 .venv/bin/python scripts/monitor_dashboard.py --compact --interval 5
 ```
 
@@ -159,7 +159,7 @@ python scripts/health_check.py --alert --continuous --interval 10
 - 健康检查: 正常
 - 部署脚本: 正常
 
-### 服务器环境 (3.38.98.169)
+### 服务器环境（示例）
 ✅ 已成功部署并运行
 - 服务状态: ✅ RUNNING (PID: 334825)
 - WebSocket: ✅ Connected
@@ -226,8 +226,8 @@ python scripts/health_check.py --alert --continuous --interval 10
 ### 日常监控
 ```bash
 # 1. 实时监控(推荐每天查看)
-ssh ubuntu@3.38.98.169
-cd ~/copybot_release
+ssh "$COPYBOT_SERVER_USER@$COPYBOT_SERVER_IP"
+cd "$COPYBOT_REMOTE_DIR"
 .venv/bin/python scripts/monitor_dashboard.py --compact
 
 # 2. 查看今日报表
@@ -249,8 +249,8 @@ cd /home/fordxx/perp-tools/copybot
 ### 持续监控(推荐)
 ```bash
 # 在服务器上设置持续健康监控
-ssh ubuntu@3.38.98.169
-cd ~/copybot_release
+ssh "$COPYBOT_SERVER_USER@$COPYBOT_SERVER_IP"
+cd "$COPYBOT_REMOTE_DIR"
 
 # 后台运行健康检查(每10分钟,异常时Telegram告警)
 nohup .venv/bin/python scripts/health_check.py --alert --continuous --interval 10 > /dev/null 2>&1 &

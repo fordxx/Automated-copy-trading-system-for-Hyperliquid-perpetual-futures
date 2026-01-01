@@ -25,7 +25,7 @@ trading_instances:
     target_address: "0xLeaderAddress"
     hyperliquid:
       account_address: "0xYourWallet"
-      private_key: "0xYourKey"
+      private_key: "__FROM_ENV__"
     copy_trading:
       copy_mode: "position"
       copy_ratio: 0.1
@@ -54,6 +54,26 @@ tail -f logs/trader_1.log
 python scripts/run_multi_trader.py monitor
 ```
 
+## 生产环境（推荐）一键管理
+
+`monitor` 模式会常驻进程并负责自动重启崩溃的实例。建议用脚本后台运行：
+
+```bash
+chmod +x scripts/manage_multi_trader.sh
+
+# 启动（后台 monitor）
+./scripts/manage_multi_trader.sh start --config config/my_multi.yaml
+
+# 状态
+./scripts/manage_multi_trader.sh status --config config/my_multi.yaml
+
+# 停止
+./scripts/manage_multi_trader.sh stop
+
+# 看 multi-trader 的 stdout 日志
+./scripts/manage_multi_trader.sh tail
+```
+
 ## 配置说明
 
 | 参数 | 说明 | 示例 |
@@ -62,11 +82,26 @@ python scripts/run_multi_trader.py monitor
 | `enabled` | 是否启用 | true/false |
 | `target_address` | Leader地址 | "0x123..." |
 | `account_address` | 你的钱包地址 | "0xABC..." |
-| `private_key` | 你的私钥 | "0xKEY..." |
+| `private_key` | 你的私钥 | `"__FROM_ENV__"`（推荐） |
 | `copy_mode` | 跟单模式 | "position" 或 "wallet" |
 | `copy_ratio` | 跟单比例 | 0.1 (10%) |
 | `max_position_size` | 最大仓位 | 10.0 |
 | `max_leverage` | 最大杠杆 | 5 |
+
+## 私钥（生产环境推荐做法）
+
+多实例建议不要把 `private_key` 明文写进 `config/my_multi.yaml`，而是放到远程机器的 `.env`，按实例名提供：
+
+- `HYPERLIQUID_PRIVATE_KEY_TRADER_LEGACY=0x...`
+- `HYPERLIQUID_PRIVATE_KEY_TRADER_WALLET_508F=0x...`
+
+规则：把实例 `name` 转成大写，非字母数字替换成 `_`，再拼到 `HYPERLIQUID_PRIVATE_KEY_` 后面。
+
+也可以用工具自动列出每个实例对应的环境变量名：
+
+```bash
+.venv/bin/python scripts/print_multi_env_keys.py --config config/my_multi.yaml
+```
 
 ## 两种跟单模式
 
@@ -89,7 +124,7 @@ trading_instances:
     target_address: "0xLeader1"
     hyperliquid:
       account_address: "0xWallet1"
-      private_key: "0xKey1"
+      private_key: "__FROM_ENV__"
     copy_trading:
       copy_ratio: 0.1
       
@@ -97,7 +132,7 @@ trading_instances:
     target_address: "0xLeader2"
     hyperliquid:
       account_address: "0xWallet2"
-      private_key: "0xKey2"
+      private_key: "__FROM_ENV__"
     copy_trading:
       copy_ratio: 0.2
       
@@ -105,7 +140,7 @@ trading_instances:
     target_address: "0xLeader3"
     hyperliquid:
       account_address: "0xWallet3"
-      private_key: "0xKey3"
+      private_key: "__FROM_ENV__"
     copy_trading:
       copy_ratio: 0.05
 ```

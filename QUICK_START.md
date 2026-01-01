@@ -83,9 +83,14 @@ copy_trading:
 # 你的Hyperliquid账户信息
 hyperliquid:
   account_address: "0x你的钱包地址"
-  private_key: "0x你的私钥"
+  private_key: "__FROM_ENV__"  # 推荐：从 .env 读取 HYPERLIQUID_PRIVATE_KEY
   use_testnet: false  # 使用主网
 ```
+
+💡 **多实例（multi-trader）建议**：不要把私钥写在 `config/my_multi.yaml`，改放到 `.env`：
+
+- 实例 `name=trader_1` → `HYPERLIQUID_PRIVATE_KEY_TRADER_1=0x...`
+- 然后用 `./scripts/validate_env.sh --multi --config config/my_multi.yaml` 检查
 
 ### 2.4 Telegram通知配置 (可选)
 

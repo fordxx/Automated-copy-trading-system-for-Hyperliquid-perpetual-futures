@@ -98,7 +98,7 @@ copy_trading:
 # Hyperliquid配置
 hyperliquid:
   account_address: "0x..."
-  private_key: "0x..."
+  private_key: "__FROM_ENV__"  # 推荐：从 .env 读取 HYPERLIQUID_PRIVATE_KEY
   use_testnet: false
 ```
 
@@ -247,6 +247,10 @@ python scripts/health_check.py --alert --continuous --interval 10
 # 配置多个实例
 cp config/multi_config.yaml config/my_multi.yaml
 nano config/my_multi.yaml
+
+# 推荐：多实例私钥不要写进 YAML，改放到 `.env`
+# 例：实例 name=trader_1 -> HYPERLIQUID_PRIVATE_KEY_TRADER_1=0x...
+./scripts/validate_env.sh --multi --config config/my_multi.yaml
 
 # 使用管理脚本（推荐）
 ./scripts/manage_multi_trader.sh

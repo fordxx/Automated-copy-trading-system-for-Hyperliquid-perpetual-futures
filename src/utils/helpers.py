@@ -12,7 +12,7 @@ class SecretRedactingFilter(logging.Filter):
     _re_private_key = re.compile(r"0x[a-fA-F0-9]{64}")
     _re_tg_token = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
     _re_env_assignments = re.compile(
-        r"\b(HYPERLIQUID_PRIVATE_KEY|TELEGRAM_BOT_TOKEN)=[^\s]+",
+        r"\b(HYPERLIQUID_PRIVATE_KEY(?:_[A-Z0-9_]+)?|TELEGRAM_BOT_TOKEN)=[^\s]+",
         re.IGNORECASE,
     )
 

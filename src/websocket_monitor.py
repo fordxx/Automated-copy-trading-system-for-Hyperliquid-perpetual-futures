@@ -365,10 +365,21 @@ class WebSocketMonitor:
                 # Defensive: if we ever see microseconds/nanoseconds.
                 timestamp = int(timestamp / 1000)
 
-            # Dedup key: SDK versions may use different identifiers.
-            tx_hash = fill.get('hash') or fill.get('txHash') or fill.get('tid') or ''
-            if not isinstance(tx_hash, str):
-                tx_hash = str(tx_hash)
+            # Dedup key MUST be unique per fill.
+            # Hyperliquid often emits many partial fills for one order that share the same `hash`
+            # (and even the same millisecond timestamp). Use (hash, tid) when possible.
+            raw_hash = fill.get('hash') or fill.get('txHash') or ''
+            if not isinstance(raw_hash, str):
+                raw_hash = str(raw_hash)
+            tid = fill.get('tid', None)
+
+            if tid is not None and raw_hash:
+                tx_hash = f"{raw_hash}:{tid}"
+            elif tid is not None:
+                tx_hash = f"tid:{tid}"
+            else:
+                tx_hash = raw_hash
+
             if not tx_hash:
                 tx_hash = f"{user}:{coin}:{side}:{size}:{price}:{timestamp}"
 
@@ -377,7 +388,8 @@ class WebSocketMonitor:
                 return
 
             # 检查时间戳（只处理启动后的新交易）
-            if timestamp <= self.last_check_timestamp:
+            # Use < (not <=) so same-millisecond fills aren't dropped.
+            if timestamp < self.last_check_timestamp:
                 return
 
             # 标记为已处理（FIFO上限）
@@ -432,7 +444,8 @@ class WebSocketMonitor:
             # 记录交易
             logger.info(f"🎯 NEW TRADE DETECTED: {coin} {side} {size} @ ${price:.2f}")
             logger.info(f"   Time: {self.stats['last_trade_time'].strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info(f"   Hash: {tx_hash[:16]}...")
+            display_hash = raw_hash or tx_hash
+            logger.info(f"   Hash: {display_hash[:16]}...")
 
             # 触发回调
             if self.on_trade_callback:

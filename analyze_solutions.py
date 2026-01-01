@@ -62,19 +62,27 @@ except Exception:
 print("🔧 仓位修复方案分析")
 print("=" * 80)
 print()
+print(f"Follower: {follower_address} (positions={len(follower_positions)})")
+print(f"Leader:   {leader_address} (positions={len(leader_positions)})")
+print(f"COPY_RATIO: {copy_ratio:.4f} ({copy_ratio * 100:.2f}%)")
+print()
 
 # 方案1：计算需要补充的仓位
-print("方案1：【自动补单】计算并自动调整所有仓位到20%")
+ratio_pct = copy_ratio * 100.0
+print(f"方案1：【自动补单】计算并自动调整所有仓位到 {ratio_pct:.2f}%")
 print("-" * 80)
 
 need_adjustment = []
 total_notional = 0
+follower_only = []
 
 for coin in sorted(set(leader_positions.keys()) | set(follower_positions.keys())):
     leader_size = leader_positions.get(coin, 0)
     follower_size = follower_positions.get(coin, 0)
     
     if leader_size == 0:
+        if follower_size != 0:
+            follower_only.append({"coin": coin, "follower": follower_size})
         continue
     
     expected = leader_size * copy_ratio
@@ -102,11 +110,17 @@ print()
 
 # 显示需要调整的前10个
 print("需要调整的交易对 (按名义金额排序，前10个):")
-print(f"{'币种':<10} {'Leader':<12} {'Follower':<12} {'期望':<12} {'差额':<12} {'名义$':<10}")
+print(f"{'币种':<10} {'Leader':<12} {'Follower':<12} {'实际%':<8} {'期望':<12} {'差额':<12} {'名义$':<10}")
 print("-" * 80)
 for item in sorted(need_adjustment, key=lambda x: abs(x['notional']), reverse=True)[:10]:
+    actual_ratio_pct = 0.0
+    if item["leader"] != 0:
+        try:
+            actual_ratio_pct = (item["follower"] / item["leader"]) * 100.0
+        except Exception:
+            actual_ratio_pct = 0.0
     print(f"{item['coin']:<10} {item['leader']:<12.1f} {item['follower']:<12.1f} "
-          f"{item['expected']:<12.1f} {item['diff']:<12.1f} ${item['notional']:<9.1f}")
+          f"{actual_ratio_pct:<8.2f} {item['expected']:<12.1f} {item['diff']:<12.1f} ${item['notional']:<9.1f}")
 
 print()
 print("实施方式：")
@@ -114,6 +128,11 @@ print("  - 开发自动调仓功能，在启动时一次性调整所有仓位")
 print("  - 优点：全自动，精确")
 print("  - 缺点：需要开发和测试，有风险")
 print()
+if follower_only:
+    print("⚠️ Follower 有但 Leader 已空仓的币种（可能是历史残留/漏平）：")
+    for item in follower_only:
+        print(f"  - {item['coin']}: follower_size={item['follower']}")
+    print()
 
 # 方案2：清空重来
 print("方案2：【清空重来】")
