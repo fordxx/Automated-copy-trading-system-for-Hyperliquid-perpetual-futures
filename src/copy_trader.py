@@ -81,6 +81,9 @@ class HyperliquidCopyTrader:
 
         # 获取钱包标识（用于电报通知中区分不同实例）
         self.wallet_label = os.getenv('INSTANCE_NAME', '').strip()
+        if not self.wallet_label:
+            # 单实例运行时，如果没有 INSTANCE_NAME，使用地址作为标识
+            self.wallet_label = self.config.get('hyperliquid', {}).get('account_address', '')[:10] + '...' if self.config.get('hyperliquid', {}).get('account_address') else ''
         self.account_address = self.config.get('hyperliquid', {}).get('account_address', '')
 
         # 初始化组件
