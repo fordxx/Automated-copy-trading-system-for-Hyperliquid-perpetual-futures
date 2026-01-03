@@ -483,7 +483,9 @@ class TelegramNotifier:
         # 显示钱包标识
         if wallet_label:
             message += f"💼 钱包: {wallet_label}\n"
-        if account_address:
+        
+        # 总是尝试显示地址
+        if account_address and isinstance(account_address, str) and len(account_address) >= 10:
             addr_short = f"{account_address[:6]}...{account_address[-4:]}"
             message += f"📍 地址: {addr_short}\n"
         
@@ -504,10 +506,12 @@ class TelegramNotifier:
         """发送关闭通知。"""
         message = "🛑 Hyperliquid Copy Trader 已停止\n\n"
         
-        # 显示钱包标识
+        # 显示钱包标识和地址
         if wallet_label:
             message += f"💼 钱包: {wallet_label}\n"
-        if account_address:
+        
+        # 总是尝试显示地址
+        if account_address and isinstance(account_address, str) and len(account_address) >= 10:
             addr_short = f"{account_address[:6]}...{account_address[-4:]}"
             message += f"📍 地址: {addr_short}\n"
         
