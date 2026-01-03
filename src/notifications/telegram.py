@@ -483,9 +483,9 @@ class TelegramNotifier:
         # 显示钱包标识
         if wallet_label:
             message += f"💼 钱包: {wallet_label}\n"
-        elif account_address:
+        if account_address:
             addr_short = f"{account_address[:6]}...{account_address[-4:]}"
-            message += f"💼 钱包: {addr_short}\n"
+            message += f"📍 地址: {addr_short}\n"
         
         if target_address:
             message += f"🎯 目标地址: {target_address}\n"
@@ -507,9 +507,9 @@ class TelegramNotifier:
         # 显示钱包标识
         if wallet_label:
             message += f"💼 钱包: {wallet_label}\n"
-        elif account_address:
+        if account_address:
             addr_short = f"{account_address[:6]}...{account_address[-4:]}"
-            message += f"💼 钱包: {addr_short}\n"
+            message += f"📍 地址: {addr_short}\n"
         
         if wallet_label or account_address:
             message += "\n"
