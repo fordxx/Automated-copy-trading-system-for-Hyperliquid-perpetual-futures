@@ -154,6 +154,8 @@ class HyperliquidCopyTrader:
         self._position_sync_gate_reductions = os.getenv('POSITION_SYNC_GATE_REDUCTIONS', 'false').lower() == 'true'
         self._position_sync_min_notional_usd = _safe_get_env_float('POSITION_SYNC_MIN_NOTIONAL_USD', 10.0, min_val=0.0)
         self._position_sync_default_leverage = _safe_get_env_int('POSITION_SYNC_DEFAULT_LEVERAGE', 5, min_val=1, max_val=50)
+        self._position_sync_require_approval = os.getenv('POSITION_SYNC_REQUIRE_APPROVAL', 'true').lower() == 'true'
+        self._position_sync_approval_timeout_s = _safe_get_env_float('POSITION_SYNC_APPROVAL_TIMEOUT_S', 900.0, min_val=10.0, max_val=7200.0)
         self._position_sync_task: Optional[asyncio.Task] = None
         self._position_sync_lock = asyncio.Lock()
         # Track leader-trade recency per coin to avoid sync fighting real-time execution.
@@ -574,6 +576,7 @@ class HyperliquidCopyTrader:
                 "",
                 "*仓位纠偏（Position Sync）*",
                 f"是否启用: `{self._position_sync_enabled}`",
+                f"是否需要人工确认: `{self._position_sync_require_approval}`",
                 f"检查间隔（秒）: `{int(self._position_sync_interval_s)}`",
                 f"价格参考模式: `{str(self._position_sync_price_ref_mode)}`",
                 f"严格模式缺失参考价回退: `{str(self._position_sync_fill_ref_fallback)}`",
@@ -585,6 +588,82 @@ class HyperliquidCopyTrader:
             await tg.send_message("\n".join(lines))
         except Exception as e:
             logger.debug(f"Failed to send startup self-check: {e}")
+
+    def _format_trade_list(
+        self,
+        trades: list[MonitoredTrade],
+        *,
+        max_lines: int = 10,
+        copy_ratio: Optional[float] = None,
+    ) -> str:
+        if not trades:
+            return ""
+        lines: list[str] = []
+        action_map = {
+            TradeAction.OPEN_LONG: "开多",
+            TradeAction.OPEN_SHORT: "开空",
+            TradeAction.CLOSE_LONG: "平多",
+            TradeAction.CLOSE_SHORT: "平空",
+        }
+        for t in trades[:max(1, int(max_lines))]:
+            try:
+                action = action_map.get(getattr(t, "action", None), str(getattr(t, "action", "") or ""))
+                size = float(getattr(t, "size", 0) or 0.0)
+                price = float(getattr(t, "price", 0) or 0.0)
+                if copy_ratio is not None:
+                    follow_size = size * float(copy_ratio)
+                    lines.append(
+                        f"• {t.coin} {action} 领头={size:.4f} 跟随={follow_size:.4f} @ ${price:.4f}"
+                    )
+                else:
+                    lines.append(f"• {t.coin} {action} {size:.4f} @ ${price:.4f}")
+            except Exception:
+                continue
+        remaining = max(0, len(trades) - len(lines))
+        if remaining > 0:
+            lines.append(f"… 以及其他 {remaining} 笔")
+        return "\n".join(lines)
+
+    def _format_sync_orders(self, orders: list[Any], *, max_lines: int = 10) -> str:
+        if not orders:
+            return ""
+        lines: list[str] = []
+        reason_map = {
+            "open_to_target": "开到目标",
+            "top_up": "加仓",
+            "reduce": "减仓",
+            "flatten": "归零",
+            "flip_close": "翻转平仓",
+            "flip_open": "翻转开仓",
+        }
+        for o in orders[:max(1, int(max_lines))]:
+            try:
+                kind = str(getattr(o, "kind", "") or "")
+                is_buy = getattr(o, "is_buy", None)
+                if kind == "open":
+                    action = "开多" if bool(is_buy) else "开空"
+                elif kind == "close":
+                    action = "平空" if bool(is_buy) else "平多"
+                else:
+                    action = kind
+                size = float(getattr(o, "size", 0) or 0.0)
+                price = float(getattr(o, "price", 0) or 0.0)
+                notional = float(getattr(o, "notional", 0) or 0.0)
+                reason_raw = str(getattr(o, "reason", "") or "")
+                reason = reason_map.get(reason_raw, reason_raw)
+                follower_before = float(getattr(o, "follower_before", 0) or 0.0)
+                expected = float(getattr(o, "expected", 0) or 0.0)
+                diff = expected - follower_before
+                lines.append(
+                    f"• {o.coin} {action} {size:.4f} @ ${price:.4f} (≈${notional:.2f}) "
+                    f"[{reason}] 当前={follower_before:.4f} 目标={expected:.4f} 差={diff:+.4f}"
+                )
+            except Exception:
+                continue
+        remaining = max(0, len(orders) - len(lines))
+        if remaining > 0:
+            lines.append(f"… 以及其他 {remaining} 笔")
+        return "\n".join(lines)
 
     async def _position_sync_loop(self) -> None:
         """Periodically correct follower positions towards leader * ratio, with price gating."""
@@ -648,7 +727,7 @@ class HyperliquidCopyTrader:
                     default_lev = int(self._position_sync_default_leverage)
                     default_lev = max(1, min(default_lev, max_lev))
 
-                    report = await self.position_manager.execute_ratio_sync(
+                    plan = await self.position_manager.plan_ratio_sync(
                         leader_address=leader_address,
                         copy_ratio=copy_ratio,
                         min_trade_size=min_trade_size,
@@ -657,7 +736,6 @@ class HyperliquidCopyTrader:
                         min_rel_diff=float(self._position_sync_min_rel_diff),
                         allow_worse_pct=float(self._position_sync_allow_worse_pct),
                         gate_reductions=bool(self._position_sync_gate_reductions),
-                        default_leverage=int(default_lev),
                         price_ref_mode=str(self._position_sync_price_ref_mode),
                         fill_ref_fallback=str(self._position_sync_fill_ref_fallback),
                         spread_gate_enabled=bool(self._position_sync_spread_gate_enabled),
@@ -666,25 +744,78 @@ class HyperliquidCopyTrader:
                         skip_recent_trade_s=float(self._position_sync_skip_recent_trade_s),
                     )
 
-                    if report.get("status") != "ok":
-                        logger.warning(f"Position sync plan failed: {report}")
+                    if plan.get("status") != "ok":
+                        logger.warning(f"Position sync plan failed: {plan}")
                         continue
 
-                    submitted = int(report.get("submitted", 0) or 0)
-                    skipped = int(report.get("skipped_count", 0) or 0)
-                    total_notional = float(report.get("total_notional", 0.0) or 0.0)
-                    errors = int(report.get("errors", 0) or 0)
+                    orders = list(plan.get("orders") or [])
+                    skipped = int(plan.get("skipped_count", 0) or 0)
+                    total_notional = float(plan.get("total_notional", 0.0) or 0.0)
 
-                    if submitted or errors:
-                        logger.warning(
-                            "🧭 Position sync: submitted=%s errors=%s skipped(price/constraints)=%s total_notional=$%.2f",
-                            submitted,
-                            errors,
-                            skipped,
-                            total_notional,
-                        )
-                    else:
+                    if not orders:
                         logger.info("🧭 Position sync: noop (nothing eligible now)")
+                    else:
+                        if self._position_sync_require_approval:
+                            nm = self.notification_manager
+                            tg = getattr(nm, 'telegram', None) if nm else None
+                            if tg is None:
+                                logger.warning("Position sync approval required but Telegram is not configured; skipping")
+                                await asyncio.sleep(float(self._position_sync_interval_s))
+                                continue
+                            token = secrets.token_hex(3).upper()
+                            wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+                            order_list = self._format_sync_orders(orders, max_lines=12)
+                            msg = (
+                                f"🧭 *Position sync pending*\n\n"
+                                f"{wallet_info}"
+                                f"Eligible orders: *{len(orders)}*\n"
+                                f"Total notional: *${total_notional:.2f}*\n"
+                                f"Skipped (price/constraints): *{skipped}*\n\n"
+                                f"{order_list}\n\n"
+                                f"Reply: `YES {token}` to execute, or `NO {token}` to skip.\n"
+                                f"Timeout: {int(self._position_sync_approval_timeout_s)}s"
+                            )
+                            await tg.send_message(msg)
+
+                            decision = await self._await_telegram_token_reply(
+                                token=token,
+                                timeout_s=float(self._position_sync_approval_timeout_s),
+                                accept_prefixes=("YES", "NO"),
+                            )
+                            if decision != "YES":
+                                logger.warning("🧭 Position sync skipped by operator")
+                                await asyncio.sleep(float(self._position_sync_interval_s))
+                                continue
+
+                        report = await self.position_manager.execute_ratio_sync_plan(
+                            plan,
+                            default_leverage=int(default_lev),
+                        )
+
+                        submitted = int(report.get("submitted", 0) or 0)
+                        errors = int(report.get("errors", 0) or 0)
+                        if submitted or errors:
+                            logger.warning(
+                                "🧭 Position sync: submitted=%s errors=%s skipped(price/constraints)=%s total_notional=$%.2f",
+                                submitted,
+                                errors,
+                                skipped,
+                                total_notional,
+                            )
+                            nm = self.notification_manager
+                            tg = getattr(nm, 'telegram', None) if nm else None
+                            if tg is not None:
+                                wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+                                await tg.send_message(
+                                    "🧭 *Position sync done*\n\n"
+                                    f"{wallet_info}"
+                                    f"Submitted: *{submitted}*\n"
+                                    f"Errors: *{errors}*\n"
+                                    f"Skipped: *{skipped}*\n"
+                                    f"Total notional: *${total_notional:.2f}*"
+                                )
+                        else:
+                            logger.info("🧭 Position sync: noop (nothing eligible now)")
 
                 await asyncio.sleep(float(self._position_sync_interval_s))
 
@@ -1084,6 +1215,16 @@ class HyperliquidCopyTrader:
             if int(t.timestamp) > int(max_ts):
                 max_ts = int(t.timestamp)
         self.ws_monitor.last_check_timestamp = int(max_ts)
+        if self.notification_manager:
+            tg = getattr(self.notification_manager, 'telegram', None)
+            if tg is not None:
+                wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+                await tg.send_message(
+                    "🔁 *Catch-up replay submitted*\n\n"
+                    f"{wallet_info}"
+                    f"Trades submitted: *{len(eligible_trades)}*\n"
+                    f"Replay spacing: *{float(self._catchup_replay_spacing_s):.1f}s* per trade"
+                )
 
     async def _replay_catchup_trades_slowly(self, trades: list[MonitoredTrade]) -> None:
         if not trades:
@@ -1113,11 +1254,15 @@ class HyperliquidCopyTrader:
 
         token1 = secrets.token_hex(3).upper()
         wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+        copy_cfg = self.config.get("copy_trading", {}) or {}
+        copy_ratio = float(copy_cfg.get("copy_ratio", 0.1) or 0.1)
+        list1 = self._format_trade_list(trades, max_lines=12, copy_ratio=copy_ratio)
         msg1 = (
             f"🔁 *Catch-up pending* (strict better only)\n\n"
             f"{wallet_info}"
             f"Eligible trades (pre-check): *{len(trades)}*\n"
             f"Replay spacing: *{float(self._catchup_replay_spacing_s):.1f}s* per trade\n\n"
+            f"{list1}\n\n"
             f"Reply: `YES {token1}` to continue, or `NO {token1}` to skip.\n"
             f"Timeout: {int(self._catchup_approval_timeout_s)}s"
         )
@@ -1147,11 +1292,13 @@ class HyperliquidCopyTrader:
 
         token2 = secrets.token_hex(3).upper()
         wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+        list2 = self._format_trade_list(filtered, max_lines=12, copy_ratio=copy_ratio)
         msg2 = (
             f"✅ *Re-check complete* (strict better now)\n\n"
             f"{wallet_info}"
             f"Still eligible: *{len(filtered)}* / {len(trades)}\n"
             f"Replay spacing: *{float(self._catchup_replay_spacing_s):.1f}s* per trade\n\n"
+            f"{list2}\n\n"
             f"Reply: `CONFIRM {token2}` to replay, or `NO {token2}` to cancel.\n"
             f"Timeout: {int(self._catchup_second_confirm_timeout_s)}s"
         )
@@ -1265,12 +1412,6 @@ class HyperliquidCopyTrader:
         nm = self.notification_manager
         tg = getattr(nm, 'telegram', None) if nm else None
         if tg is None:
-            return None
-
-        # 在多实例模式下禁用命令轮询（避免 getUpdates 冲突）
-        instance_name = os.getenv('INSTANCE_NAME', '').strip()
-        if instance_name and instance_name != 'copy_trader':
-            logger.debug("⏭️ Skipping Telegram command polling in multi-instance mode")
             return None
 
         # Drain old updates the first time we ever poll, so we don't match stale messages.

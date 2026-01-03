@@ -1592,6 +1592,10 @@ class PositionManager:
             exclude_recent_trades=exclude_recent_trades,
             skip_recent_trade_s=skip_recent_trade_s,
         )
+        return await self.execute_ratio_sync_plan(plan, default_leverage=default_leverage)
+
+    async def execute_ratio_sync_plan(self, plan: Dict[str, Any], *, default_leverage: int) -> Dict[str, Any]:
+        """Execute a pre-computed ratio-sync plan (does not re-plan)."""
         if plan.get("status") != "ok":
             return plan
 

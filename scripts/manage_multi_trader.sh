@@ -39,6 +39,18 @@ wrapper_pids() {
   pgrep -af -- "$RUNNER" | grep -F " monitor" | awk '$2 == "flock" {print $1}' || true
 }
 
+cleanup_orphan_procs() {
+  # Clean leftover multiprocessing helpers from previous crashes (only for this repo venv).
+  local stale
+  stale="$(pgrep -af -- "$ROOT_DIR/.venv/bin/python -c from multiprocessing" | awk '{print $1}' || true)"
+  if [[ -n "$stale" ]]; then
+    echo "🧹 清理残留 multiprocessing 进程: $stale"
+    for pid in $stale; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+  fi
+}
+
 status() {
   echo "--------------------------------------------------"
   echo "📌 Multi-trader 状态检查"
@@ -97,6 +109,8 @@ start_service() {
     status --config "$cfg"
     return 0
   fi
+
+  cleanup_orphan_procs
 
   # 启动 monitor 进程，使用 Python 的单进程锁保护
   # 该锁将确保同时只有一个 monitor 进程运行
