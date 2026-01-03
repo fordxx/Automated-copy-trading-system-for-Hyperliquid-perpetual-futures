@@ -1267,6 +1267,12 @@ class HyperliquidCopyTrader:
         if tg is None:
             return None
 
+        # 在多实例模式下禁用命令轮询（避免 getUpdates 冲突）
+        instance_name = os.getenv('INSTANCE_NAME', '').strip()
+        if instance_name and instance_name != 'copy_trader':
+            logger.debug("⏭️ Skipping Telegram command polling in multi-instance mode")
+            return None
+
         # Drain old updates the first time we ever poll, so we don't match stale messages.
         if self._tg_update_offset is None:
             updates = await tg.get_updates(offset=None, timeout_s=0)
