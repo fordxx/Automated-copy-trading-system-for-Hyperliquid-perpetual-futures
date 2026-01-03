@@ -139,6 +139,87 @@ class TelegramNotifier:
             logger.error(f"Error getting Telegram updates: {e}")
             return []
 
+    async def set_my_commands(self) -> bool:
+        """设置机器人命令列表。
+
+        Returns:
+            是否设置成功
+        """
+        if not self.session:
+            await self.initialize()
+
+        try:
+            url = f"{self.base_url}/setMyCommands"
+            commands = [
+                {"command": "help", "description": "显示帮助信息"},
+                {"command": "status", "description": "查看当前状态"},
+                {"command": "wallets", "description": "列出所有钱包实例"},
+            ]
+            data = {"commands": commands}
+
+            async with self.session.post(url, json=data) as response:
+                result = await response.json()
+                if result.get("ok"):
+                    logger.info("✅ Telegram commands registered")
+                    return True
+                else:
+                    logger.error(f"Failed to set commands: {result}")
+                    return False
+        except Exception as e:
+            logger.error(f"Error setting Telegram commands: {e}")
+            return False
+
+    def parse_command(self, text: str) -> Optional[tuple[str, str]]:
+        """解析命令。
+
+        Args:
+            text: 消息文本
+
+        Returns:
+            (command, args) 或 None 如果不是命令
+        """
+        if not text or not text.startswith("/"):
+            return None
+        
+        parts = text.split(" ", 1)
+        command = parts[0][1:]  # 移除 /
+        args = parts[1] if len(parts) > 1 else ""
+        return command, args
+
+    async def reply_to_message(self, message_id: int, reply_text: str) -> bool:
+        """回复消息。
+
+        Args:
+            message_id: 要回复的消息ID
+            reply_text: 回复文本
+
+        Returns:
+            是否发送成功
+        """
+        if not self.session:
+            await self.initialize()
+
+        try:
+            url = f"{self.base_url}/sendMessage"
+            data = {
+                "chat_id": self.chat_id,
+                "text": reply_text,
+                "reply_to_message_id": message_id,
+                "disable_web_page_preview": True
+            }
+
+            async with self.session.post(url, json=data) as response:
+                if response.status == 200:
+                    logger.debug(f"Reply sent to message {message_id}")
+                    return True
+                else:
+                    error_data = await response.json()
+                    logger.error(f"Failed to send reply: {error_data}")
+                    return False
+        except Exception as e:
+            logger.error(f"Error sending reply: {e}")
+            return False
+
     async def send_trade_notification(self, trade_data: Dict[str, Any]):
         """发送交易通知。
 
@@ -509,3 +590,20 @@ class NotificationManager:
                 wallet_label=self.wallet_label if self.wallet_label else None,
                 account_address=self.account_address if self.account_address else None,
             )
+
+    async def register_commands(self):
+        """注册机器人命令。"""
+        if self.telegram:
+            await self.telegram.set_my_commands()
+
+    def parse_command(self, text: str) -> Optional[tuple[str, str]]:
+        """解析命令。"""
+        if self.telegram:
+            return self.telegram.parse_command(text)
+        return None
+
+    async def reply_to_command(self, message_id: int, reply_text: str) -> bool:
+        """回复命令消息。"""
+        if self.telegram:
+            return await self.telegram.reply_to_message(message_id, reply_text)
+        return False
