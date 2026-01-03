@@ -79,6 +79,10 @@ class HyperliquidCopyTrader:
         self.config = self._load_config(config_path, config_dict)
         self.running = False
 
+        # 获取钱包标识（用于电报通知中区分不同实例）
+        self.wallet_label = os.getenv('INSTANCE_NAME', '').strip()
+        self.account_address = self.config.get('hyperliquid', {}).get('account_address', '')
+
         # 初始化组件
         self.trade_monitor: Optional[TradeMonitor] = None
         self.ws_monitor: Optional[WebSocketMonitor] = None
@@ -391,7 +395,8 @@ class HyperliquidCopyTrader:
     def _init_notifications(self):
         """初始化通知管理器。"""
         try:
-            self.notification_manager = NotificationManager(self.config)
+            # Pass instance labels so notifications can identify which wallet/instance
+            self.notification_manager = NotificationManager(self.config, wallet_label=self.wallet_label, account_address=self.account_address)
             logger.info("✅ Notification manager initialized")
         except Exception as e:
             logger.error(f"Failed to initialize notification manager: {e}")
@@ -536,7 +541,9 @@ class HyperliquidCopyTrader:
             lines = [
                 "🧾 *启动自检（配置摘要）*",
                 "",
+                f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}",
                 f"目标地址: `{str(self.config.get('target_address', '') or '')}`",
+                f"跟随地址: `{str(self.config.get('hyperliquid', {}).get('account_address', '') or '')}`",
                 f"是否使用 WebSocket: `{str(self.use_websocket)}`",
                 "",
                 "*跟单设置*",
@@ -1098,8 +1105,10 @@ class HyperliquidCopyTrader:
             return []
 
         token1 = secrets.token_hex(3).upper()
+        wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
         msg1 = (
-            "🔁 *Catch-up pending* (strict better only)\n\n"
+            f"🔁 *Catch-up pending* (strict better only)\n\n"
+            f"{wallet_info}"
             f"Eligible trades (pre-check): *{len(trades)}*\n"
             f"Replay spacing: *{float(self._catchup_replay_spacing_s):.1f}s* per trade\n\n"
             f"Reply: `YES {token1}` to continue, or `NO {token1}` to skip.\n"
@@ -1118,18 +1127,22 @@ class HyperliquidCopyTrader:
         # Re-check target current positions (if the target already closed, no need to backfill).
         relevant = await self._filter_trades_target_still_open(trades)
         if not relevant:
-            await tg.send_message("ℹ️ Re-check result: target has already closed (or is flat). Skipping catch-up.")
+            wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+            await tg.send_message(f"ℹ️ Re-check result: target has already closed (or is flat). Skipping catch-up.\n\n{wallet_info}")
             return []
 
         # Re-check current mids and re-filter strictly better *now*.
         filtered = await self._filter_trades_strict_better_now(relevant)
         if not filtered:
-            await tg.send_message("ℹ️ Re-check result: 0 trades are still strictly better. Skipping catch-up.")
+            wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+            await tg.send_message(f"ℹ️ Re-check result: 0 trades are still strictly better. Skipping catch-up.\n\n{wallet_info}")
             return []
 
         token2 = secrets.token_hex(3).upper()
+        wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
         msg2 = (
-            "✅ *Re-check complete* (strict better now)\n\n"
+            f"✅ *Re-check complete* (strict better now)\n\n"
+            f"{wallet_info}"
             f"Still eligible: *{len(filtered)}* / {len(trades)}\n"
             f"Replay spacing: *{float(self._catchup_replay_spacing_s):.1f}s* per trade\n\n"
             f"Reply: `CONFIRM {token2}` to replay, or `NO {token2}` to cancel.\n"
@@ -1145,7 +1158,8 @@ class HyperliquidCopyTrader:
         if decision2 != "CONFIRM":
             return []
 
-        await tg.send_message(f"✅ Catch-up confirmed: `{len(filtered)}` trades will replay slowly")
+        wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+        await tg.send_message(f"✅ Catch-up confirmed: `{len(filtered)}` trades will replay slowly\n\n{wallet_info}")
         return filtered
 
     async def _filter_trades_strict_better_now(self, trades: list[MonitoredTrade]) -> list[MonitoredTrade]:
@@ -1292,7 +1306,8 @@ class HyperliquidCopyTrader:
             await asyncio.sleep(max(0.2, float(self._catchup_approval_poll_s)))
 
         try:
-            await tg.send_message(f"⏱️ Catch-up prompt timed out (no reply): skipping `... {token}`")
+            wallet_info = f"💼 钱包: {self.wallet_label or f'{self.account_address[:6]}...{self.account_address[-4:]}'}\n\n" if self.wallet_label or self.account_address else ""
+            await tg.send_message(f"⏱️ Catch-up prompt timed out (no reply): skipping `... {token}`\n\n{wallet_info}")
         except Exception:
             pass
         return None
@@ -1455,6 +1470,9 @@ class HyperliquidCopyTrader:
                     'sz_decimals': sz_decimals,
                     'min_trade_size': min_trade_size_report if min_trade_size_report is not None else min_trade_size,
                     'max_notional_per_trade_usd': max_notional_report if max_notional_report is not None else max_notional,
+                    # 包含钱包标识，便于在通知中区分多实例 / 多钱包
+                    'wallet_label': self.wallet_label,
+                    'account_address': self.account_address,
                 }
                 await self.notification_manager.notify_trade(trade_data)
 
@@ -1513,6 +1531,15 @@ class HyperliquidCopyTrader:
                     # 没仓位不推送；并重置计时器，方便下次有仓位时尽快发一次状态。
                     self._last_status_notification = 0.0
                 elif (current_time - self._last_status_notification) >= self._status_notification_interval:
+                    # 在状态摘要中注入钱包标识，方便通知时直接显示是哪条实例/地址
+                    try:
+                        summary['wallet_label'] = self.wallet_label
+                    except Exception:
+                        pass
+                    try:
+                        summary['account_address'] = self.account_address
+                    except Exception:
+                        pass
                     await self.notification_manager.notify_status(summary)
                     self._last_status_notification = current_time
 
