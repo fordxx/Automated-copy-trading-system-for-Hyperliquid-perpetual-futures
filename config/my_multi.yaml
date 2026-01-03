@@ -1,0 +1,92 @@
+# Multi-Wallet Multi-Leader Configuration Template
+# 多钱包多Leader跟单配置
+# 修改此文件以配置你的跟单实例
+
+# 全局配置
+global_settings:
+  # 是否使用测试网
+  use_testnet: false
+  
+  # 日志配置
+  logging:
+    level: INFO
+    base_dir: logs
+  
+  # Telegram通知配置（所有实例共享）
+  telegram:
+    enabled: true
+    bot_token: "YOUR_BOT_TOKEN"  # 从 @BotFather 获取
+    chat_id: "YOUR_CHAT_ID"      # 从 @userinfobot 获取
+
+# 跟单实例配置列表
+# 每个实例独立运行，使用不同的钱包跟踪目标地址
+trading_instances:
+  # 实例1: 钱包1跟单
+  - name: "wallet_1"
+    enabled: true
+    
+    # Leader配置（要跟踪的目标地址）
+    target_address: "0xTARGET_ADDRESS_1"
+    exclude_addresses:
+      - "FOLLOWER_ADDRESS_1"  # 避免跟踪自己的交易
+    
+    # Follower钱包配置（你的钱包）
+    hyperliquid:
+      account_address: "FOLLOWER_ADDRESS_1"  # 钱包1地址
+      private_key: "__FROM_ENV__"  # 从 .env 读取：HYPERLIQUID_PRIVATE_KEY_WALLET_1=0x...
+      vault_address: ""
+    
+    # 跟单参数
+    copy_trading:
+      copy_mode: "position"      # "position" 或 "wallet"
+      copy_ratio: 0.1            # 10% (position模式)
+      max_position_size: 10.0
+      min_trade_size: 0.01
+      max_leverage: 5
+    
+    # 风险控制
+    risk_management:
+      max_drawdown: 0.1
+      stop_loss_ratio: 0.05
+      take_profit_ratio: 0.1
+    
+    # 监控配置
+    monitoring:
+      poll_interval: 30
+      max_retries: 3
+      retry_delay: 5
+
+  # 实例2: 钱包2跟单
+  - name: "wallet_2"
+    enabled: true
+    
+    # Leader配置
+    target_address: "0xTARGET_ADDRESS_1"  # 可以是同一个leader或不同的
+    exclude_addresses:
+      - "FOLLOWER_ADDRESS_2"
+    
+    # Follower钱包配置
+    hyperliquid:
+      account_address: "FOLLOWER_ADDRESS_2"  # 钱包2地址
+      private_key: "__FROM_ENV__"  # 从 .env 读取：HYPERLIQUID_PRIVATE_KEY_WALLET_2=0x...
+      vault_address: ""
+    
+    # 跟单参数
+    copy_trading:
+      copy_mode: "position"
+      copy_ratio: 0.1
+      max_position_size: 10.0
+      min_trade_size: 0.01
+      max_leverage: 5
+    
+    # 风险控制
+    risk_management:
+      max_drawdown: 0.1
+      stop_loss_ratio: 0.05
+      take_profit_ratio: 0.1
+    
+    # 监控配置
+    monitoring:
+      poll_interval: 30
+      max_retries: 3
+      retry_delay: 5
