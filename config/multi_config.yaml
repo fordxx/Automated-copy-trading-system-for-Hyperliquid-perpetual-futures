@@ -11,11 +11,11 @@ global_settings:
     level: INFO
     base_dir: logs
   
-  # Telegram通知配置（全局，所有实例共享）
+  # Telegram通知配置（全局默认，可被实例配置覆盖）
   telegram:
     enabled: false
-    bot_token: ""  # 从 @BotFather 获取
-    chat_id: ""    # 从 @userinfobot 获取
+    bot_token: ""  # 从 @BotFather 获取（默认用于所有实例，除非实例有自己的配置）
+    chat_id: ""    # 从 @userinfobot 获取（默认用于所有实例，除非实例有自己的配置）
 
 # 跟单实例配置列表
 # 每个实例独立运行，使用不同的钱包跟踪不同的leader

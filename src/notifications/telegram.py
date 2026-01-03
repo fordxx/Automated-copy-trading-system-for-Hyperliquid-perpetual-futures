@@ -342,12 +342,20 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"Error sending status notification: {e}")
 
-    async def send_alert_notification(self, alert_type: str, message: str):
+    async def send_alert_notification(
+        self, 
+        alert_type: str, 
+        message: str,
+        wallet_label: Optional[str] = None,
+        account_address: Optional[str] = None,
+    ):
         """发送警报通知。
 
         Args:
             alert_type: 警报类型
             message: 警报消息
+            wallet_label: 钱包标识
+            account_address: 钱包地址
         """
         try:
             emoji_map = {
@@ -358,7 +366,19 @@ class TelegramNotifier:
             }
 
             emoji = emoji_map.get(alert_type.lower(), '🔔')
-            full_message = f"{emoji} {alert_type.upper()}\n\n{message}"
+            full_message = f"{emoji} {alert_type.upper()}\n\n"
+            
+            # 显示钱包标识
+            if wallet_label:
+                full_message += f"💼 钱包: {wallet_label}\n"
+            elif account_address:
+                addr_short = f"{account_address[:6]}...{account_address[-4:]}"
+                full_message += f"💼 钱包: {addr_short}\n"
+            
+            if wallet_label or account_address:
+                full_message += "\n"
+            
+            full_message += message
 
             await self.send_message(full_message)
 
@@ -369,21 +389,45 @@ class TelegramNotifier:
         self,
         target_address: Optional[str] = None,
         follower_address: Optional[str] = None,
+        wallet_label: Optional[str] = None,
+        account_address: Optional[str] = None,
     ):
         """发送启动通知。"""
         message = "🚀 Hyperliquid Copy Trader 已启动\n\n"
+        
+        # 显示钱包标识
+        if wallet_label:
+            message += f"💼 钱包: {wallet_label}\n"
+        elif account_address:
+            addr_short = f"{account_address[:6]}...{account_address[-4:]}"
+            message += f"💼 钱包: {addr_short}\n"
+        
         if target_address:
             message += f"🎯 目标地址: {target_address}\n"
         if follower_address:
             message += f"👣 跟随地址: {follower_address}\n"
-        if target_address or follower_address:
+        if wallet_label or account_address or target_address or follower_address:
             message += "\n"
         message += "系统正在监控目标地址的交易活动..."
         await self.send_message(message)
 
-    async def send_shutdown_notification(self):
+    async def send_shutdown_notification(
+        self,
+        wallet_label: Optional[str] = None,
+        account_address: Optional[str] = None,
+    ):
         """发送关闭通知。"""
         message = "🛑 Hyperliquid Copy Trader 已停止\n\n"
+        
+        # 显示钱包标识
+        if wallet_label:
+            message += f"💼 钱包: {wallet_label}\n"
+        elif account_address:
+            addr_short = f"{account_address[:6]}...{account_address[-4:]}"
+            message += f"💼 钱包: {addr_short}\n"
+        
+        if wallet_label or account_address:
+            message += "\n"
         message += "系统已安全关闭。"
         await self.send_message(message)
 
@@ -394,8 +438,10 @@ class NotificationManager:
     统一管理各种通知渠道。
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], wallet_label: str = "", account_address: str = ""):
         self.config = config
+        self.wallet_label = wallet_label
+        self.account_address = account_address
         self.telegram: Optional[TelegramNotifier] = None
 
         self._initialize_notifiers()
@@ -437,7 +483,12 @@ class NotificationManager:
     async def notify_alert(self, alert_type: str, message: str):
         """发送警报。"""
         if self.telegram:
-            await self.telegram.send_alert_notification(alert_type, message)
+            await self.telegram.send_alert_notification(
+                alert_type, 
+                message,
+                wallet_label=self.wallet_label if self.wallet_label else None,
+                account_address=self.account_address if self.account_address else None,
+            )
 
     async def notify_startup(self):
         """通知系统启动。"""
@@ -447,9 +498,14 @@ class NotificationManager:
             await self.telegram.send_startup_notification(
                 target_address=target if target else None,
                 follower_address=follower if follower else None,
+                wallet_label=self.wallet_label if self.wallet_label else None,
+                account_address=self.account_address if self.account_address else None,
             )
 
     async def notify_shutdown(self):
         """通知系统关闭。"""
         if self.telegram:
-            await self.telegram.send_shutdown_notification()
+            await self.telegram.send_shutdown_notification(
+                wallet_label=self.wallet_label if self.wallet_label else None,
+                account_address=self.account_address if self.account_address else None,
+            )

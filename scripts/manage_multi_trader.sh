@@ -98,19 +98,12 @@ start_service() {
     return 0
   fi
 
-  # Detach the monitor process from the current terminal/process group.
-  # Use `flock` as a long-running wrapper so the lock is held for the full lifetime.
-  if command -v flock >/dev/null 2>&1; then
-    nohup flock -n "$LOCK_FILE" "$PY" "$RUNNER" monitor --config "$cfg" >> "$LOG_STDOUT" 2>&1 < /dev/null &
-  else
-    if command -v setsid >/dev/null 2>&1; then
-      setsid -f "$PY" "$RUNNER" monitor --config "$cfg" >> "$LOG_STDOUT" 2>&1 < /dev/null
-    else
-      nohup "$PY" "$RUNNER" monitor --config "$cfg" >> "$LOG_STDOUT" 2>&1 < /dev/null &
-    fi
-  fi
-
-  sleep 0.8
+  # 启动 monitor 进程，使用 Python 的单进程锁保护
+  # 该锁将确保同时只有一个 monitor 进程运行
+  echo "🔒 使用单进程锁启动..."
+  nohup "$PY" "$RUNNER" monitor --config "$cfg" >> "$LOG_STDOUT" 2>&1 < /dev/null &
+  
+  sleep 1.5
 
   # Record PID by matching the monitor command (best-effort).
   local pid

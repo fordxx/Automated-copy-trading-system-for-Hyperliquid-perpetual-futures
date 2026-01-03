@@ -3,6 +3,11 @@
 
 启动和管理多个跟单实例，每个实例使用不同的钱包跟踪不同的leader。
 支持多进程模式，确保隔离性和稳定性。
+
+单进程保护：
+- 该程序同时只能运行一个主进程
+- 尝试启动多个会立即失败
+- 自动清理已死亡进程的锁文件
 """
 import asyncio
 import logging
@@ -23,6 +28,7 @@ sys.path.insert(0, str(project_root))
 
 from src.copy_trader import HyperliquidCopyTrader
 from src.utils.helpers import setup_logging
+from src.utils.single_instance_lock import SingleInstanceLock
 
 
 class MultiInstanceManager:
@@ -48,7 +54,8 @@ class MultiInstanceManager:
         self.stop_all()
         sys.exit(0)
     
-    def _run_instance(self, instance_config: dict, instance_name: str):
+    @staticmethod
+    def _run_instance(global_config: dict, instance_config: dict, instance_name: str):
         """在子进程中运行单个实例"""
         try:
             # 设置进程标题
@@ -65,47 +72,48 @@ class MultiInstanceManager:
             load_dotenv(dotenv_path=project_root / ".env", override=False)
         except Exception:
             pass
-        
+
         try:
             # 创建日志目录
-            log_dir = Path(self.config['global_settings']['logging']['base_dir'])
+            log_dir = Path(global_config['logging']['base_dir'])
             log_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # 配置日志
             log_file = log_dir / f"{instance_name}.log"
             log_config = {
                 'logging': {
-                    'level': self.config['global_settings']['logging']['level'],
+                    'level': global_config['logging']['level'],
                     'file': str(log_file)
                 }
             }
             setup_logging(log_config)
-            
+
             logger = logging.getLogger(__name__)
             logger.info(f"🚀 Starting instance: {instance_name}")
             logger.info(f"📊 Target: {instance_config['target_address']}")
             logger.info(f"🏦 Account: {instance_config['hyperliquid']['account_address']}")
             logger.info(f"📈 Copy Ratio: {instance_config['copy_trading']['copy_ratio'] * 100:.1f}%")
-            
+
             # 合并全局配置和实例配置
-            merged_config = self._merge_config(instance_config)
-            
+            merged_config = MultiInstanceManager._merge_config_static(global_config, instance_config)
+
             # 创建临时配置文件（使用环境变量传递敏感信息）
-            self._set_env_vars(instance_config, instance_name)
-            
+            MultiInstanceManager._set_env_vars_static(global_config, instance_config, instance_name)
+
             # 创建trader实例
             trader = HyperliquidCopyTrader(config_dict=merged_config)
-            
+
             # 运行trader
             asyncio.run(trader.start())
-            
+
         except Exception as e:
             logging.error(f"❌ Instance {instance_name} error: {e}")
             logging.exception("Instance error details")
             sys.exit(1)
     
-    def _merge_config(self, instance_config: dict) -> dict:
-        """合并全局配置和实例配置"""
+    @staticmethod
+    def _merge_config_static(global_config: dict, instance_config: dict) -> dict:
+        """合并全局配置和实例配置（静态版本）"""
         merged = {
             'target_address': instance_config['target_address'],
             'exclude_addresses': instance_config.get('exclude_addresses', []),
@@ -113,14 +121,18 @@ class MultiInstanceManager:
             'risk_management': instance_config.get('risk_management', {}),
             'hyperliquid': instance_config['hyperliquid'],
             'monitoring': instance_config.get('monitoring', {}),
-            'logging': self.config['global_settings']['logging'],
-            'telegram': self.config['global_settings'].get('telegram', {})
+            'logging': global_config['logging'],
+            'telegram': global_config.get('telegram', {})
         }
-        
+
         # 添加use_testnet
-        merged['hyperliquid']['use_testnet'] = self.config['global_settings'].get('use_testnet', False)
-        
+        merged['hyperliquid']['use_testnet'] = global_config.get('use_testnet', False)
+
         return merged
+
+    def _merge_config(self, instance_config: dict) -> dict:
+        """合并全局配置和实例配置"""
+        return self._merge_config_static(self.config['global_settings'], instance_config)
 
     @staticmethod
     def _instance_env_suffix(instance_name: str) -> str:
@@ -133,10 +145,11 @@ class MultiInstanceManager:
         raw = raw.strip("_")
         return raw or "INSTANCE"
     
-    def _set_env_vars(self, instance_config: dict, instance_name: str):
-        """为实例设置环境变量"""
+    @staticmethod
+    def _set_env_vars_static(global_config: dict, instance_config: dict, instance_name: str):
+        """为实例设置环境变量（静态版本）"""
         # 设置实例特定的环境变量
-        suffix = self._instance_env_suffix(instance_name)
+        suffix = MultiInstanceManager._instance_env_suffix(instance_name)
         os.environ[f'INSTANCE_NAME'] = instance_name
         os.environ['TARGET_ADDRESS'] = str(instance_config['target_address'])
         os.environ['HYPERLIQUID_ACCOUNT_ADDRESS'] = str(instance_config['hyperliquid']['account_address'])
@@ -176,6 +189,16 @@ class MultiInstanceManager:
         os.environ["MAX_LEVERAGE"] = str(copy_cfg.get("max_leverage", 5))
         os.environ["MAX_NOTIONAL_PER_TRADE_USD"] = str(copy_cfg.get("max_notional_per_trade_usd", 0.0))
 
+        # Per-instance risk management: allows independent stop-loss/drawdown per wallet.
+        risk_cfg = instance_config.get("risk_management", {}) or {}
+        if risk_cfg:
+            if "max_drawdown" in risk_cfg:
+                os.environ["MAX_DRAWDOWN"] = str(risk_cfg.get("max_drawdown"))
+            if "stop_loss_ratio" in risk_cfg:
+                os.environ["STOP_LOSS_RATIO"] = str(risk_cfg.get("stop_loss_ratio"))
+            if "take_profit_ratio" in risk_cfg:
+                os.environ["TAKE_PROFIT_RATIO"] = str(risk_cfg.get("take_profit_ratio"))
+
         # Exclude addresses: env expects comma-separated string.
         exclude = instance_config.get("exclude_addresses", []) or []
         if isinstance(exclude, list):
@@ -184,34 +207,38 @@ class MultiInstanceManager:
             os.environ["EXCLUDE_ADDRESSES"] = str(exclude)
 
         # Network selection: enforce per-instance consistent setting.
-        os.environ["HYPERLIQUID_ENV"] = "testnet" if bool(self.config["global_settings"].get("use_testnet")) else "mainnet"
-        
+        os.environ["HYPERLIQUID_ENV"] = "testnet" if bool(global_config.get("use_testnet")) else "mainnet"
+
         if instance_config['hyperliquid'].get('vault_address'):
             os.environ['HYPERLIQUID_VAULT_ADDRESS'] = instance_config['hyperliquid']['vault_address']
+
+    def _set_env_vars(self, instance_config: dict, instance_name: str):
+        """为实例设置环境变量"""
+        return self._set_env_vars_static(self.config['global_settings'], instance_config, instance_name)
     
     def start_instance(self, instance_name: str, instance_config: dict):
         """启动单个实例"""
         if instance_name in self.processes and self.processes[instance_name].is_alive():
             print(f"⚠️  Instance '{instance_name}' is already running")
             return
-        
+
         print(f"🚀 Starting instance: {instance_name}")
         print(f"   Target: {instance_config['target_address'][:10]}...")
         print(f"   Account: {instance_config['hyperliquid']['account_address'][:10]}...")
         print(f"   Copy Ratio: {instance_config['copy_trading']['copy_ratio'] * 100:.1f}%")
-        
-        # 创建进程
+
+        # 创建进程 - 传递 global_config 作为参数，避免 pickle self
         process = mp.Process(
-            target=self._run_instance,
-            args=(instance_config, instance_name),
+            target=MultiInstanceManager._run_instance,
+            args=(self.config['global_settings'], instance_config, instance_name),
             name=f"copybot-{instance_name}"
         )
         process.start()
         self.processes[instance_name] = process
-        
+
         # 等待一下确保启动
         time.sleep(1)
-        
+
         if process.is_alive():
             print(f"✅ Instance '{instance_name}' started (PID: {process.pid})")
         else:
@@ -367,6 +394,28 @@ class MultiInstanceManager:
 
 def main():
     """主函数"""
+    # 🔒 单进程保护：获取互斥锁
+    lock_file = project_root / 'logs' / 'multi_trader.lock'
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock = SingleInstanceLock(str(lock_file))
+    
+    # 只在启动真实实例时检查锁（status和monitor除外初期检查）
+    # monitor 会在启动实例时检查
+    parser_peek = argparse.ArgumentParser(add_help=False)
+    parser_peek.add_argument('action', nargs='?', default='status')
+    args_peek, _ = parser_peek.parse_known_args()
+    
+    # 对于 start/restart/monitor 操作，需要获取锁
+    if args_peek.action in ['start', 'restart', 'monitor']:
+        if not lock.acquire():
+            print("\n❌ 无法启动新进程：已有其他多钱包跟单进程在运行")
+            print("   请先停止现有进程：./scripts/manage_multi_trader.sh stop")
+            sys.exit(1)
+        
+        # 注册清理函数以确保锁被释放
+        import atexit
+        atexit.register(lock.release)
+    
     parser = argparse.ArgumentParser(
         description='Multi-Instance Hyperliquid Copy Trader',
         formatter_class=argparse.RawDescriptionHelpFormatter,

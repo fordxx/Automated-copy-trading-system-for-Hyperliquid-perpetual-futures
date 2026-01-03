@@ -1,51 +1,108 @@
-# Hyperliquid Copy Trader - 快速开始指南
+# Hyperliquid Copy Trader - 5分钟快速上手
 
-## 项目概述
+![Version](https://img.shields.io/badge/version-1.5.0-blue.svg)
+![Difficulty](https://img.shields.io/badge/difficulty-⭐%20入门-green.svg)
 
-这是一个自动跟单Hyperliquid交易所链上地址交易的系统。通过监控指定地址的交易行为，自动复制到自己的账户中。
+**目标读者：** 新手用户、首次使用者
+**预计时间：** 5-10 分钟
+**前置要求：**
+- Python 3.8+ 已安装
+- 有 Hyperliquid 账户
+- 基本的命令行操作能力
 
-## 核心功能
+---
 
-- 🔍 **实时监控**: 监控指定地址的链上交易
-- 🤖 **自动跟单**: 根据配置的比例自动复制交易
-- ⚡ **低延迟**: 使用Hyperliquid的高性能API
-- 🛡️ **风险控制**: 内置止损和最大仓位限制
-- 📊 **状态监控**: 实时显示仓位和盈亏情况
+## 🎯 项目简介
 
-## 快速开始
+自动跟单 Hyperliquid 交易所链上地址的专业交易系统。监控指定 Leader 的交易行为，按配置比例自动复制到您的账户。
 
-### 1. 环境准备
+### ✨ 核心亮点
+
+- 🔍 **双监控架构**: WebSocket 实时 + REST API 备份，确保零遗漏
+- 🤖 **智能跟单**: 支持固定比例（Position）和动态比例（Wallet）两种模式
+- ⚡ **毫秒级延迟**: WebSocket 优先，实时响应交易
+- 🛡️ **多重风控**: 止损、最大仓位、翻仓安全、价格门控
+- 📊 **实时监控**: 监控面板、交易报表、健康告警
+- 💼 **多实例支持**: 一台服务器同时跟踪多个 Leader
+
+---
+
+## 🚀 5步快速开始
+
+### 步骤 1️⃣：安装依赖 (1分钟)
 
 ```bash
 # 进入项目目录
 cd /home/fordxx/perp-tools/copybot
 
-# 运行设置脚本
-chmod +x scripts/setup.sh
-./scripts/setup.sh
+# 创建虚拟环境（推荐）
+python3 -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+# .venv\Scripts\activate  # Windows
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 验证安装
+python -c "from hyperliquid.info import Info; print('✅ 安装成功!')"
 ```
 
-### 2. 配置设置（推荐：使用 .env）
+### 步骤 2️⃣：配置环境变量 (2分钟)
 
-相比直接改 YAML，使用 `.env` 更适合后台运行（并且程序会显式从仓库根目录加载 `.env`）。
+**推荐使用 `.env` 文件**（更安全，适合后台运行）
 
 ```bash
+# 1. 复制模板
 cp .env.template .env
-nano .env
 
-./scripts/validate_env.sh
+# 2. 编辑配置（使用您喜欢的编辑器）
+nano .env
+# 或
+vim .env
 ```
 
-最关键的几项：
+**⚠️ 必须配置的关键项：**
 
 ```bash
-TARGET_ADDRESS=0x...
-HYPERLIQUID_ACCOUNT_ADDRESS=0x...
-HYPERLIQUID_PRIVATE_KEY=0x...
-HYPERLIQUID_ENV=mainnet
+# === 必需配置 ===
+TARGET_ADDRESS=0xLeader钱包地址          # 要跟单的Leader地址
+HYPERLIQUID_ACCOUNT_ADDRESS=0x您的地址   # 您的Hyperliquid钱包地址
+HYPERLIQUID_PRIVATE_KEY=0x您的私钥       # 您的私钥（严格保密！）
+HYPERLIQUID_ENV=mainnet                  # mainnet 或 testnet
 
-# 跟单比例（示例：0.2=20%）
-COPY_RATIO=0.2
+# === 跟单配置 ===
+COPY_MODE=position                       # position(固定比例) 或 wallet(动态比例)
+COPY_RATIO=0.01                          # 🚨 首次建议从 0.01 (1%) 开始！
+
+# === 可选但推荐 ===
+MAX_POSITION_SIZE=1.0                    # 单币种最大仓位
+MAX_NOTIONAL_PER_TRADE_USD=500          # 单笔最大金额（USD）
+TELEGRAM_ENABLED=true                    # 启用通知
+TELEGRAM_BOT_TOKEN=你的Bot令牌
+TELEGRAM_CHAT_ID=你的ChatID
+```
+
+**💡 提示：** 首次使用请从**极小比例**开始（0.001 = 0.1%），确认系统稳定后再逐步提高！
+
+### 步骤 3️⃣：验证配置 (30秒)
+
+```bash
+# 验证环境变量配置
+./scripts/validate_env.sh
+
+# 如果使用 YAML 配置，也可以验证
+./scripts/check_config.sh
+```
+
+**预期输出：**
+```
+✅ TARGET_ADDRESS: 0x...
+✅ HYPERLIQUID_ACCOUNT_ADDRESS: 0x...
+✅ HYPERLIQUID_PRIVATE_KEY: *** (已配置)
+✅ COPY_MODE: position
+✅ COPY_RATIO: 0.01
+...
+✅ 所有配置验证通过！
 ```
 
 ### 2.2 也可以使用 YAML（可选）
@@ -142,39 +199,123 @@ nano .env
 ./scripts/setup_telegram.sh
 ```
 
-### 3. 测试运行
+### 步骤 4️⃣：测试 Telegram 通知（可选，1分钟）
+
+如果启用了 Telegram 通知，先测试一下：
 
 ```bash
-# 激活虚拟环境
+# 激活虚拟环境（如果还没激活）
 source .venv/bin/activate
 
-# 可选: 测试Telegram通知
+# 测试 Telegram 通知
 python scripts/test_telegram.py YOUR_BOT_TOKEN YOUR_CHAT_ID
-
-# 运行跟单程序
-python scripts/run_copy_trader.py
 ```
 
-## 一键启动（推荐：带菜单）
+**如何获取 Telegram 配置？**
+1. 找 [@BotFather](https://t.me/botfather)，发送 `/newbot` 创建 Bot，获取 `BOT_TOKEN`
+2. 找 [@userinfobot](https://t.me/userinfobot)，发送任意消息，获取 `CHAT_ID`
 
-如果你不想记命令，直接使用菜单脚本：
+### 步骤 5️⃣：启动跟单程序 (1分钟)
+
+**方式一：一键启动（🌟 推荐新手）**
 
 ```bash
-cd /home/fordxx/perp-tools/copybot
+# 启动交互式菜单
 chmod +x scripts/manage_copy_trader.sh
 ./scripts/manage_copy_trader.sh
 ```
 
-菜单里可以：一键启动/停止/重启、查看进程状态、实时看日志。
+菜单提供的功能：
+- ✅ 一键启动/停止/重启
+- 📊 查看进程状态
+- 📝 实时查看日志
+- 🔍 搜索日志关键字
 
-也可以不进菜单直接用子命令：
+**方式二：命令行启动（快速）**
+
+```bash
+# 直接启动
+./scripts/manage_copy_trader.sh start
+
+# 查看状态
+./scripts/manage_copy_trader.sh status
+
+# 实时查看日志（Ctrl+C 退出，不会停止服务）
+./scripts/manage_copy_trader.sh tail app
+
+# 查看最近 100 行日志
+./scripts/manage_copy_trader.sh last 100 app
+```
+
+**方式三：Python 脚本启动**
+
+```bash
+# 使用环境变量配置
+python scripts/run_copy_trader.py --env
+
+# 或使用 YAML 配置
+python scripts/run_copy_trader.py --config config/my_config.yaml
+```
+
+---
+
+## ✅ 验证运行
+
+启动后，检查以下内容确认正常运行：
+
+### 1. 检查进程状态
 
 ```bash
 ./scripts/manage_copy_trader.sh status
-./scripts/manage_copy_trader.sh restart
+```
 
+**预期输出：**
+```
+✅ Copy Trader 正在运行
+PID: 12345
+运行时间: 5 分钟
+```
+
+### 2. 查看日志
+
+```bash
+# 实时日志
 ./scripts/manage_copy_trader.sh tail app
-./scripts/manage_copy_trader.sh tail stdout
+
+# 或直接查看文件
+tail -f logs/copy_trader.log
+```
+
+**正常日志示例：**
+```
+[INFO] Starting HyperliquidCopyTrader...
+[INFO] WebSocket monitor started
+[INFO] REST monitor started
+[INFO] Monitoring Leader: 0x...
+[INFO] Follower account: 0x...
+[INFO] Copy mode: position, ratio: 0.01
+```
+
+### 3. Telegram 通知
+
+如果启用了 Telegram，您应该会收到启动摘要：
+
+```
+🚀 Copy Trader 已启动
+
+📋 配置摘要：
+├─ Leader: 0x...abcd
+├─ Follower: 0x...ef01
+├─ 模式: Position (固定比例)
+├─ 比例: 1.00%
+└─ WebSocket: ✅ 已启用
+
+📊 当前状态：
+├─ Leader 仓位: 3个
+├─ Follower 仓位: 3个
+└─ 账户余额: $1,234.56
+
+系统已就绪，开始监控...
 ```
 
 ## 安全提醒

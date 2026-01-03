@@ -1,17 +1,119 @@
-# Hyperliquid Copy Trader 仓位同步问题 - AI 接手提示词
+# Hyperliquid Copy Trader - AI 接手开发文档
 
-## 项目背景
+> **文档目的：** 帮助开发者和 AI 快速理解项目、诊断问题并实现新功能
 
-这是一个 Hyperliquid 交易所的自动跟单系统，用于复制目标地址（Leader）的交易。
+**最后更新：** 2026-01-01
+**项目版本：** v1.5.0
+**文档状态：** ✅ 已全面更新
+
+---
+
+## 📋 项目概览
+
+这是一个 **Hyperliquid 交易所的专业自动跟单系统**，用于实时复制目标地址（Leader）的交易到您的账户（Follower）。
+
+### 基本信息
 
 - **项目路径**: `/home/fordxx/perp-tools/copybot`
-- **语言**: Python 3
-- **主要依赖**: hyperliquid-python-sdk
-- **配置文件**: `.env`, `config/config.yaml`
+- **编程语言**: Python 3.8+
+- **主要依赖**: hyperliquid-python-sdk, aiohttp, websockets
+- **配置方式**: 环境变量（`.env`）+ YAML（`config/*.yaml`）
+- **代码规模**: ~6791 行核心代码，14个运维脚本，13份文档
 
-## 当前问题
+### 核心架构
 
-系统正常接收并复制新交易信号（每笔都正确复制20%），但**总仓位比例严重偏离**。
+```
+WebSocket/REST Monitor → Trade Dedup → Batch Processing
+         ↓
+Position Manager → Hyperliquid Exchange → Telegram Notification
+```
+
+**详细架构文档：** [ARCHITECTURE.md](ARCHITECTURE.md) - 完整的技术架构、数据流、模块说明
+
+---
+
+## 📚 必读文档清单
+
+在开始开发前，请阅读以下文档：
+
+| 文档 | 用途 | 优先级 |
+|------|------|--------|
+| [README.md](README.md) | 项目总览、快速上手 | ⭐⭐⭐⭐⭐ |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | 技术架构、模块设计 | ⭐⭐⭐⭐⭐ |
+| [ENV_SETUP_GUIDE.md](ENV_SETUP_GUIDE.md) | 环境变量配置详解 | ⭐⭐⭐⭐ |
+| [OPTIMIZATION_GUIDE.md](OPTIMIZATION_GUIDE.md) | 性能优化和运维工具 | ⭐⭐⭐ |
+| [COPY_MODE_GUIDE.md](COPY_MODE_GUIDE.md) | 跟单模式详解 | ⭐⭐⭐ |
+
+---
+
+## 🔍 项目现状（v1.5.0）
+
+### ✅ 已实现的功能
+
+1. **双监控架构**
+   - WebSocket 实时推送（优先，低延迟）
+   - REST API 轮询备份（30秒间隔）
+   - 中心化去重机制（共享 `_processed_tx_hashes`）
+
+2. **双模式跟单**
+   - Position 模式：固定比例跟单
+   - Wallet 模式：动态钱包余额比例跟单
+
+3. **高级风控**
+   - 翻仓安全模式（先平后开）
+   - 价格门控（仓位纠偏时）
+   - 点差门控（避免宽点差追单）
+   - 止损/止盈机制
+
+4. **性能优化**
+   - 交易批处理（聚合高频交易）
+   - 智能缓存（meta、fills、positions）
+   - 429速率限制自动退避
+
+5. **运维工具**
+   - 实时监控面板
+   - 交易统计报表
+   - 健康检查告警
+   - 一键部署脚本
+
+6. **多实例支持**
+   - 多钱包多Leader并行跟单
+   - 独立进程、独立日志
+   - 自动重启监控
+
+### 🚧 已知问题和限制
+
+**1. 仓位偏离问题（已有解决方案）**
+- **现象**：新交易跟单正确，但总仓位比例偏离目标
+- **原因**：Leader平仓时Follower无仓位，系统跳过；Leader重新开仓，Follower只跟新增部分
+- **解决方案**：
+  - ✅ 手动工具：`scripts/sync_positions.py`
+  - ✅ 自动纠偏：启用 `POSITION_SYNC_ENABLED=true`（带价格门控）
+  - 详见下方"仓位同步"章节
+
+**2. 精度问题**
+- **现象**：某些币种提示 `Order has invalid size`
+- **原因**：未按该币种的 `szDecimals` 精度向下取整
+- **解决方案**：`position_manager.py` 已实现自动精度处理，刷新 meta 缓存即可
+
+**3. 429 速率限制**
+- **现象**：高频交易时偶尔触发 429
+- **缓解**：
+  - 已实现指数退避（最大300秒）
+  - 已实现交易批处理（`TRADE_BATCH_WINDOW_MS`）
+  - 调高批处理窗口可进一步降低频率
+
+**4. WebSocket 空闲重连**
+- **现象**：Leader不活跃时频繁重连日志
+- **解决方案**：
+  - 调高 `WEBSOCKET_IDLE_TIMEOUT_S`（如60秒）
+  - 启用日志节流 `WEBSOCKET_IDLE_LOG_INTERVAL_S=300`
+
+---
+
+## 📖 常见开发任务
+
+### 任务1：诊断仓位偏离问题
 
 ### 问题数据示例
 
