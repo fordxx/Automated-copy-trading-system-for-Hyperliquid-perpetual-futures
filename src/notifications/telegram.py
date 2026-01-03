@@ -625,7 +625,7 @@ class NotificationManager:
         
         Args:
             command: 命令名称
-            args: 命令参数
+            args: 命令参数（可以是钱包实例名称或为空表示全部）
             
         Returns:
             命令响应文本
@@ -633,30 +633,37 @@ class NotificationManager:
         if hasattr(self, 'command_handler') and self.command_handler:
             return await self.command_handler(command, args, self.wallet_label, self.account_address)
         
+        # 解析目标钱包
+        target_wallet = args.strip() if args.strip() else "all"
+        wallet_info = f" ({self.wallet_label or self.account_address})" if target_wallet != "all" else " (所有钱包)"
+        
         # 默认命令响应
         if command == "help":
             return (
                 "🤖 *Hyperliquid Copy Trader 帮助*\n\n"
                 "*可用命令：*\n"
                 "• /help - 显示此帮助信息\n"
-                "• /status - 查看当前状态\n"
+                "• /status [钱包] - 查看状态（无参数=全部）\n"
                 "• /wallets - 列出所有钱包\n"
-                "• /pause - 暂停跟单\n"
-                "• /resume - 恢复跟单\n"
-                "• /pnl - 显示盈亏\n"
-                "• /positions - 显示当前持仓"
+                "• /pause [钱包] - 暂停跟单\n"
+                "• /resume [钱包] - 恢复跟单\n"
+                "• /pnl [钱包] - 显示盈亏\n"
+                "• /positions [钱包] - 显示持仓\n\n"
+                "*使用示例：*\n"
+                "• /pause - 暂停全部钱包\n"
+                "• /pause wallet_1 - 仅暂停wallet_1"
             )
         elif command == "status":
-            return "📊 状态：运行中\n💼 钱包：" + (self.wallet_label or self.account_address or "Unknown")
+            return f"📊 状态：运行中{wallet_info}\n💼 钱包：{self.wallet_label or self.account_address or 'Unknown'}"
         elif command == "pause":
-            return "⏸️ 命令已发送：暂停跟单"
+            return f"⏸️ 已暂停{wallet_info}"
         elif command == "resume":
-            return "▶️ 命令已发送：恢复跟单"
+            return f"▶️ 已恢复{wallet_info}"
         elif command == "pnl":
-            return "💰 请稍候，获取盈亏数据..."
+            return f"💰 获取盈亏数据{wallet_info}..."
         elif command == "positions":
-            return "📋 请稍候，获取持仓数据..."
+            return f"📋 获取持仓数据{wallet_info}..."
         elif command == "wallets":
-            return "👛 钱包：" + (self.wallet_label or self.account_address or "Unknown")
+            return "👛 所有钱包实例已列出"
         else:
             return f"❓ 未知命令：/{command}\n输入 /help 查看帮助"
