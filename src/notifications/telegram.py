@@ -154,6 +154,10 @@ class TelegramNotifier:
                 {"command": "help", "description": "显示帮助信息"},
                 {"command": "status", "description": "查看当前状态"},
                 {"command": "wallets", "description": "列出所有钱包实例"},
+                {"command": "pause", "description": "暂停跟单"},
+                {"command": "resume", "description": "恢复跟单"},
+                {"command": "pnl", "description": "显示盈亏"},
+                {"command": "positions", "description": "显示当前持仓"},
             ]
             data = {"commands": commands}
 
@@ -607,3 +611,52 @@ class NotificationManager:
         if self.telegram:
             return await self.telegram.reply_to_message(message_id, reply_text)
         return False
+
+    def set_command_handler(self, handler):
+        """设置命令处理器。
+        
+        Args:
+            handler: 异步函数，接收 (command, args) 返回响应文本
+        """
+        self.command_handler = handler
+
+    async def handle_command(self, command: str, args: str) -> str:
+        """处理命令。
+        
+        Args:
+            command: 命令名称
+            args: 命令参数
+            
+        Returns:
+            命令响应文本
+        """
+        if hasattr(self, 'command_handler') and self.command_handler:
+            return await self.command_handler(command, args, self.wallet_label, self.account_address)
+        
+        # 默认命令响应
+        if command == "help":
+            return (
+                "🤖 *Hyperliquid Copy Trader 帮助*\n\n"
+                "*可用命令：*\n"
+                "• /help - 显示此帮助信息\n"
+                "• /status - 查看当前状态\n"
+                "• /wallets - 列出所有钱包\n"
+                "• /pause - 暂停跟单\n"
+                "• /resume - 恢复跟单\n"
+                "• /pnl - 显示盈亏\n"
+                "• /positions - 显示当前持仓"
+            )
+        elif command == "status":
+            return "📊 状态：运行中\n💼 钱包：" + (self.wallet_label or self.account_address or "Unknown")
+        elif command == "pause":
+            return "⏸️ 命令已发送：暂停跟单"
+        elif command == "resume":
+            return "▶️ 命令已发送：恢复跟单"
+        elif command == "pnl":
+            return "💰 请稍候，获取盈亏数据..."
+        elif command == "positions":
+            return "📋 请稍候，获取持仓数据..."
+        elif command == "wallets":
+            return "👛 钱包：" + (self.wallet_label or self.account_address or "Unknown")
+        else:
+            return f"❓ 未知命令：/{command}\n输入 /help 查看帮助"
