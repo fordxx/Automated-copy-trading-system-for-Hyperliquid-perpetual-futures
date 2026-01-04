@@ -114,6 +114,8 @@ class MultiInstanceManager:
     @staticmethod
     def _merge_config_static(global_config: dict, instance_config: dict) -> dict:
         """合并全局配置和实例配置（静态版本）"""
+        telegram_cfg = dict(global_config.get('telegram', {}) or {})
+        telegram_cfg.update(instance_config.get('telegram', {}) or {})
         merged = {
             'target_address': instance_config['target_address'],
             'exclude_addresses': instance_config.get('exclude_addresses', []),
@@ -122,7 +124,7 @@ class MultiInstanceManager:
             'hyperliquid': instance_config['hyperliquid'],
             'monitoring': instance_config.get('monitoring', {}),
             'logging': global_config['logging'],
-            'telegram': global_config.get('telegram', {})
+            'telegram': telegram_cfg,
         }
 
         # 添加use_testnet
@@ -196,6 +198,8 @@ class MultiInstanceManager:
                 os.environ["MAX_DRAWDOWN"] = str(risk_cfg.get("max_drawdown"))
             if "stop_loss_ratio" in risk_cfg:
                 os.environ["STOP_LOSS_RATIO"] = str(risk_cfg.get("stop_loss_ratio"))
+            if "stop_loss_close_pct" in risk_cfg:
+                os.environ["STOP_LOSS_CLOSE_PCT"] = str(risk_cfg.get("stop_loss_close_pct"))
             if "take_profit_ratio" in risk_cfg:
                 os.environ["TAKE_PROFIT_RATIO"] = str(risk_cfg.get("take_profit_ratio"))
 
@@ -205,6 +209,22 @@ class MultiInstanceManager:
             os.environ["EXCLUDE_ADDRESSES"] = ",".join(str(a).strip() for a in exclude if str(a).strip())
         else:
             os.environ["EXCLUDE_ADDRESSES"] = str(exclude)
+
+        # Telegram per-instance overrides (support separate chat IDs per wallet).
+        telegram_cfg = dict(global_config.get("telegram", {}) or {})
+        telegram_cfg.update(instance_config.get("telegram", {}) or {})
+        env_bot = os.getenv(f"TELEGRAM_BOT_TOKEN_{suffix}") or ""
+        env_chat = os.getenv(f"TELEGRAM_CHAT_ID_{suffix}") or ""
+        if env_bot:
+            telegram_cfg["bot_token"] = env_bot
+        if env_chat:
+            telegram_cfg["chat_id"] = env_chat
+        if "enabled" in telegram_cfg:
+            os.environ["TELEGRAM_ENABLED"] = "true" if telegram_cfg.get("enabled") else "false"
+        if telegram_cfg.get("bot_token"):
+            os.environ["TELEGRAM_BOT_TOKEN"] = str(telegram_cfg.get("bot_token"))
+        if telegram_cfg.get("chat_id"):
+            os.environ["TELEGRAM_CHAT_ID"] = str(telegram_cfg.get("chat_id"))
 
         # Network selection: enforce per-instance consistent setting.
         os.environ["HYPERLIQUID_ENV"] = "testnet" if bool(global_config.get("use_testnet")) else "mainnet"

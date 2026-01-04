@@ -3,10 +3,12 @@
 提供Telegram机器人通知功能，实时推送交易信息。
 """
 import asyncio
+import json
 import logging
 import os
 import time
 from typing import Dict, Any, Optional
+
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,12 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         self.session: Optional[aiohttp.ClientSession] = None
+        self._updates_source = str(os.getenv("TELEGRAM_UPDATES_SOURCE", "") or "").strip().lower()
+        self._webhook_queue_path = str(os.getenv("TELEGRAM_WEBHOOK_QUEUE_PATH", "") or "").strip()
+        try:
+            self._webhook_poll_sleep_s = float(os.getenv("TELEGRAM_WEBHOOK_POLL_S", "0.5") or 0.5)
+        except Exception:
+            self._webhook_poll_sleep_s = 0.5
 
         # Noise reduction: throttle repeated skipped trade notifications (e.g. many CLOSEs after already flat).
         try:
@@ -114,6 +122,10 @@ class TelegramNotifier:
         Returns:
             List of update dicts.
         """
+        if self._updates_source == "webhook" or self._webhook_queue_path:
+            updates = await self._get_updates_from_webhook_queue(offset=offset, timeout_s=timeout_s)
+            return updates
+
         if not self.session:
             await self.initialize()
 
@@ -138,6 +150,52 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"Error getting Telegram updates: {e}")
             return []
+
+    async def _get_updates_from_webhook_queue(
+        self,
+        *,
+        offset: Optional[int],
+        timeout_s: int,
+    ) -> list[dict]:
+        queue_path = self._webhook_queue_path
+        if not queue_path:
+            logger.error("Telegram webhook mode enabled but TELEGRAM_WEBHOOK_QUEUE_PATH is empty")
+            return []
+
+        def _read_updates() -> list[dict]:
+            try:
+                with open(queue_path, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except FileNotFoundError:
+                return []
+            except Exception as e:
+                logger.error(f"Failed to read webhook queue: {e}")
+                return []
+
+            updates: list[dict] = []
+            for line in lines:
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                update_id = data.get("update_id")
+                if offset is not None:
+                    try:
+                        if int(update_id or 0) < int(offset):
+                            continue
+                    except Exception:
+                        continue
+                updates.append(data)
+            return updates
+
+        updates = await asyncio.to_thread(_read_updates)
+        if not updates and timeout_s:
+            await asyncio.sleep(min(max(0.05, self._webhook_poll_sleep_s), float(timeout_s)))
+        return updates
 
     async def set_my_commands(self) -> bool:
         """设置机器人命令列表。
@@ -367,6 +425,9 @@ class TelegramNotifier:
             total_notional = status_data.get('total_notional_usd')
             wallet_label = status_data.get('wallet_label')
             account_address = status_data.get('account_address')
+            stop_loss_ratio = status_data.get('stop_loss_ratio')
+            stop_loss_usd = status_data.get('stop_loss_usd')
+            buffer_to_stop = status_data.get('buffer_to_stop')
 
             message = f"📊 状态报告\n\n"
             # 显示钱包标识（优先使用实例名称，其次使用地址简写）
@@ -382,6 +443,26 @@ class TelegramNotifier:
                     message += f"🧾 持仓名义: ${float(total_notional):.2f}\n"
                 except Exception:
                     pass
+            if stop_loss_usd is not None:
+                try:
+                    if stop_loss_ratio is not None and float(stop_loss_ratio) <= 1:
+                        message += f"🧯 止损线: ${float(stop_loss_usd):.2f} ({float(stop_loss_ratio):.2%})\n"
+                    else:
+                        message += f"🧯 止损线: ${float(stop_loss_usd):.2f}\n"
+                except Exception:
+                    pass
+            elif stop_loss_ratio is not None:
+                try:
+                    message += f"🧯 止损线: 计算中 ({float(stop_loss_ratio):.2%})\n"
+                except Exception:
+                    pass
+            if buffer_to_stop is not None:
+                try:
+                    message += f"📉 距离止损: ${float(buffer_to_stop):.2f}\n"
+                except Exception:
+                    pass
+            elif stop_loss_ratio is not None:
+                message += "📉 距离止损: 计算中\n"
 
             positions = status_data.get('positions', [])
             if positions:

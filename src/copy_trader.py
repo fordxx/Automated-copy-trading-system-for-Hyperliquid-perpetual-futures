@@ -185,6 +185,7 @@ class HyperliquidCopyTrader:
         self._risk_auto_close_cooldown_s = float(os.getenv('RISK_AUTO_CLOSE_COOLDOWN_S', '300'))
         self._risk_auto_close_and_stop = os.getenv('RISK_AUTO_CLOSE_AND_STOP', 'false').lower() == 'true'
         self._risk_halt_trading_on_stop_loss = os.getenv('RISK_HALT_TRADING_ON_STOP_LOSS', 'true').lower() == 'true'
+        self._risk_stop_loss_close_pct = _safe_get_env_float('STOP_LOSS_CLOSE_PCT', 1.0, min_val=0.0, max_val=1.0)
         self._stop_loss_exec_in_progress = False
         self._last_stop_loss_exec_at = 0.0
         self._trading_halted = False
@@ -692,6 +693,7 @@ class HyperliquidCopyTrader:
                     copy_cfg = self.config.get("copy_trading", {}) or {}
                     copy_mode = str(copy_cfg.get("copy_mode", "position") or "position").strip().lower()
                     copy_ratio = float(copy_cfg.get("copy_ratio", 0.1) or 0.1)
+                    wallet_ratio_multiplier = float(copy_cfg.get("wallet_ratio_multiplier", 1.0) or 1.0)
                     min_trade_size = float(copy_cfg.get("min_trade_size", 0.01) or 0.01)
                     max_notional = float(copy_cfg.get("max_notional_per_trade_usd", 0.0) or 0.0)
 
@@ -702,11 +704,14 @@ class HyperliquidCopyTrader:
                             follower_balance = await self.position_manager.get_account_value_usd_async()
                             leader_balance = await self.position_manager.get_account_value_usd_async(leader_address)
                             if follower_balance and leader_balance and float(leader_balance) > 0:
-                                copy_ratio = float(follower_balance) / float(leader_balance)
+                                base_ratio = float(follower_balance) / float(leader_balance)
+                                copy_ratio = base_ratio * float(wallet_ratio_multiplier)
                                 logger.info(
-                                    "💰 Position sync wallet ratio: follower=%.2fU leader=%.2fU ratio=%.4f",
+                                    "💰 Position sync wallet ratio: follower=%.2fU leader=%.2fU base=%.4f multiplier=%.2f ratio=%.4f",
                                     float(follower_balance),
                                     float(leader_balance),
+                                    float(base_ratio),
+                                    float(wallet_ratio_multiplier),
                                     float(copy_ratio),
                                 )
                             else:
@@ -1531,6 +1536,8 @@ class HyperliquidCopyTrader:
             # 获取跟单参数
             copy_mode = copy_config.get('copy_mode', 'position')
             copy_ratio = copy_config.get('copy_ratio', 0.1)
+            wallet_ratio_multiplier = copy_config.get('wallet_ratio_multiplier', 1.0)
+            force_close_on_leader_flat = bool(copy_config.get('force_close_on_leader_flat', False))
             max_size = copy_config.get('max_position_size', 1.0)
             max_leverage = copy_config.get('max_leverage', 5)
             max_notional = copy_config.get('max_notional_per_trade_usd', 0.0)
@@ -1547,6 +1554,8 @@ class HyperliquidCopyTrader:
                 min_trade_size=min_trade_size,
                 copy_mode=copy_mode,
                 leader_address=leader_address,
+                wallet_ratio_multiplier=wallet_ratio_multiplier,
+                force_close_on_leader_flat=force_close_on_leader_flat,
             )
 
             # 计算响应时间
@@ -1648,6 +1657,10 @@ class HyperliquidCopyTrader:
         try:
             if not self.position_manager:
                 return
+            try:
+                await self.position_manager.update_positions(force=True, ignore_backoff=True)
+            except Exception:
+                pass
 
             summary = self.position_manager.get_positions_summary()
             total_pnl = summary.get('total_pnl', 0.0)
@@ -1672,11 +1685,51 @@ class HyperliquidCopyTrader:
                 except Exception:
                     continue
             summary['total_notional_usd'] = float(total_notional_usd)
+            try:
+                summary['unrealized_pnl'] = float(total_pnl)
+            except Exception:
+                pass
 
             logger.info(
                 f"Status: {total_positions} positions, "
                 f"Total PnL: ${float(total_pnl):.2f}"
             )
+
+            # 计算止损线/距离止损（用于状态报告展示）
+            account_value = None
+            if self.position_manager:
+                account_value = self.position_manager.get_account_value_usd()
+                if account_value is None:
+                    try:
+                        await self.position_manager.update_positions(force=True, ignore_backoff=True)
+                        account_value = self.position_manager.get_account_value_usd()
+                    except Exception:
+                        pass
+                if account_value is None:
+                    try:
+                        account_value = await self.position_manager.get_account_value_usd_async(self.account_address)
+                    except Exception:
+                        pass
+            if account_value is not None:
+                try:
+                    risk_cfg = self.config.get('risk_management', {}) or {}
+                    stop_ratio = float(risk_cfg.get('stop_loss_ratio', 0.0) or 0.0)
+                    stop_usd = stop_ratio if stop_ratio > 1 else (float(account_value) * stop_ratio)
+                    buffer_to_stop = float(stop_usd) + float(total_pnl)
+                    summary['stop_loss_ratio'] = float(stop_ratio)
+                    summary['stop_loss_usd'] = float(stop_usd)
+                    summary['buffer_to_stop'] = float(buffer_to_stop)
+                except Exception:
+                    pass
+            else:
+                try:
+                    risk_cfg = self.config.get('risk_management', {}) or {}
+                    stop_ratio = float(risk_cfg.get('stop_loss_ratio', 0.0) or 0.0)
+                    summary['stop_loss_ratio'] = float(stop_ratio)
+                    summary['stop_loss_usd'] = None
+                    summary['buffer_to_stop'] = None
+                except Exception:
+                    pass
 
             # 发送状态通知（有仓位才发；并且限频，避免频繁打扰）
             current_time = time.time()
@@ -1698,9 +1751,6 @@ class HyperliquidCopyTrader:
                     self._last_status_notification = current_time
 
             # 检查风险控制（用账户权益计算阈值，避免把比例当成美元）
-            account_value = None
-            if self.position_manager:
-                account_value = self.position_manager.get_account_value_usd()
             await self._check_risk_limits(float(total_pnl), account_value_usd=account_value)
 
         except Exception as e:
@@ -1818,8 +1868,12 @@ class HyperliquidCopyTrader:
             except Exception:
                 pass
 
-            report = await self.position_manager.close_all_positions()
-            logger.warning(f"🧯 Stop-loss auto-close submitted: pnl={current_pnl:.2f} threshold={stop_loss_usd:.2f} report={report}")
+            close_pct = float(self._risk_stop_loss_close_pct)
+            report = await self.position_manager.close_positions_ratio(close_pct)
+            logger.warning(
+                f"🧯 Stop-loss auto-close submitted: pct={close_pct:.2f} pnl={current_pnl:.2f} "
+                f"threshold={stop_loss_usd:.2f} report={report}"
+            )
 
             # Halt trading to avoid immediately re-opening via new leader fills.
             if self._risk_halt_trading_on_stop_loss:
@@ -1831,9 +1885,10 @@ class HyperliquidCopyTrader:
                 try:
                     await self.notification_manager.notify_alert(
                         "error",
-                        "🧯 已执行止损自动平仓（Auto-close）\n"
+                        "🧯 已执行止损自动减仓（Auto-close）\n"
                         f"当前亏损: ${current_pnl:.2f}\n"
                         f"止损线: ${stop_loss_usd:.2f}\n"
+                        f"减仓比例: {close_pct:.0%}\n"
                         f"结果: {report}",
                     )
                 except Exception:

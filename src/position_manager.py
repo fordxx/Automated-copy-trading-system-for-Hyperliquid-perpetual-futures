@@ -117,6 +117,9 @@ class PositionManager:
         self._fills_cache_at_by_leader: Dict[str, float] = {}
         self._fills_cache_by_leader: Dict[str, Dict[str, Dict[str, float]]] = {}
         self._fills_cache_ttl_s = float(os.getenv('POSITION_SYNC_FILLS_TTL_S', '10') or 10)
+        self._leader_positions_cache_at_by_addr: Dict[str, float] = {}
+        self._leader_positions_cache_by_addr: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self._leader_positions_cache_ttl_s = float(os.getenv('LEADER_POS_CACHE_TTL_S', '2.0') or 2.0)
         self._l2_cache_at_by_coin: Dict[str, float] = {}
         self._l2_cache_by_coin: Dict[str, Tuple[float, float, float]] = {}
         self._l2_cache_ttl_s = float(os.getenv('POSITION_SYNC_L2_TTL_S', '2') or 2)
@@ -310,6 +313,63 @@ class PositionManager:
 
         return {"status": "submitted", "closed": results, "errors": int(errors)}
 
+    async def close_positions_ratio(self, close_pct: float) -> Dict[str, Any]:
+        """Attempt to close a percentage of all current positions."""
+        pct = float(close_pct or 0.0)
+        if pct >= 1.0:
+            return await self.close_all_positions()
+        if pct <= 0.0:
+            return {"status": "noop", "closed": [], "errors": 0}
+
+        results: List[Dict[str, Any]] = []
+        # Best-effort refresh to avoid reduce-only errors from stale positions.
+        try:
+            state = await asyncio.to_thread(self.info.user_state, self.exchange.account_address)
+            if isinstance(state, dict):
+                updated = self._positions_from_user_state_with_entry(state)
+                self.positions = {
+                    coin: Position(
+                        coin=coin,
+                        size=float(meta.get("size", 0.0) or 0.0),
+                        entry_price=float(meta.get("entry_px", 0.0) or 0.0),
+                        leverage=int(float(meta.get("leverage", 1.0) or 1.0)),
+                    )
+                    for coin, meta in updated.items()
+                }
+        except Exception as e:
+            logger.warning(f"Stop-loss refresh failed (using cached positions): {e}")
+
+        snapshot = list(self.positions.values())
+        if not snapshot:
+            return {"status": "noop", "closed": [], "errors": 0}
+
+        errors = 0
+        for pos in snapshot:
+            try:
+                coin = str(pos.coin)
+                size_to_close = abs(float(pos.size)) * pct
+                if size_to_close <= 0:
+                    continue
+                closed = await self._market_close_partial(coin, size_to_close)
+                results.append({"coin": coin, "requested": size_to_close, "closed": float(closed or 0.0)})
+            except Exception as e:
+                errors += 1
+                results.append(
+                    {
+                        "coin": getattr(pos, 'coin', ''),
+                        "requested": abs(float(getattr(pos, 'size', 0.0) or 0.0)) * pct,
+                        "closed": 0.0,
+                        "error": str(e),
+                    }
+                )
+
+        try:
+            self.schedule_refresh(delay_s=1.0)
+        except Exception:
+            pass
+
+        return {"status": "submitted", "closed": results, "errors": int(errors)}
+
     def get_account_value_usd(self, address: Optional[str] = None) -> Optional[float]:
         """Return the account value (equity) in USD.
 
@@ -404,6 +464,8 @@ class PositionManager:
         min_trade_size: float = 0.01,
         copy_mode: str = "position",
         leader_address: Optional[str] = None,
+        wallet_ratio_multiplier: float = 1.0,
+        force_close_on_leader_flat: bool = False,
     ) -> Dict[str, Any]:
         """执行跟单交易（极速开/平）。
 
@@ -430,12 +492,19 @@ class PositionManager:
                 try:
                     follower_balance = await self.get_account_value_usd_async()
                     leader_balance = await self.get_account_value_usd_async(leader_address)
-                    
+
                     if follower_balance and leader_balance and leader_balance > 0:
-                        actual_copy_ratio = follower_balance / leader_balance
+                        base_ratio = float(follower_balance) / float(leader_balance)
+                        multiplier = float(wallet_ratio_multiplier or 1.0)
+                        actual_copy_ratio = base_ratio * multiplier
                         logger.info(
-                            f"💰 Wallet mode: Follower={follower_balance:.2f}U, "
-                            f"Leader={leader_balance:.2f}U, Ratio={actual_copy_ratio:.4f}"
+                            "💰 Wallet mode: Follower=%.2fU, Leader=%.2fU, "
+                            "BaseRatio=%.4f, Multiplier=%.2f, Ratio=%.4f",
+                            float(follower_balance),
+                            float(leader_balance),
+                            float(base_ratio),
+                            float(multiplier),
+                            float(actual_copy_ratio),
                         )
                     else:
                         # Wallet模式失败：跳过交易，不降级到Position模式
@@ -487,26 +556,8 @@ class PositionManager:
             copy_size_rounded = self._round_down(copy_size, decimals)
             rounded_down = copy_size_rounded != copy_size
             copy_size = copy_size_rounded
-            min_sz = float(min_trade_size or 0.0)
-            if copy_size < min_sz:
-                logger.info(f"Copy size {copy_size} too small, skipping")
-                return {
-                    "status": "skipped",
-                    "reason": "too_small",
-                    "coin": trade.coin,
-                    "action": str(trade.action),
-                    "requested_size": float(requested_size),
-                    "order_size": 0.0,
-                    "max_size": float(max_size),
-                    "max_notional_per_trade_usd": float(max_notional),
-                    "min_trade_size": float(min_sz),
-                    "capped_by_size": bool(cap_by_size),
-                    "capped_by_notional": bool(cap_by_notional),
-                    "rounded_down": bool(rounded_down),
-                    "sz_decimals": int(decimals),
-                }
-
             position = self.get_position(coin)
+            min_sz = float(min_trade_size or 0.0)
 
             # Reduce-only semantics: if the leader is closing but we have no position,
             # do NOT open a reverse position.
@@ -537,6 +588,40 @@ class PositionManager:
                         "rounded_down": bool(rounded_down),
                         "sz_decimals": int(decimals),
                         "follower_pos": float(pos_size),
+                    }
+                force_full_close = False
+                if force_close_on_leader_flat and leader_address:
+                    leader_size = await self._get_leader_position_size(leader_address, coin)
+                    if abs(float(leader_size or 0.0)) <= 0.0:
+                        force_full = abs(float(position.size))
+                        copy_size = self._round_down(force_full, decimals)
+                        rounded_down = copy_size != force_full
+                        cap_by_size = False
+                        cap_by_notional = False
+                        force_full_close = True
+                        logger.info(
+                            "FORCE CLOSE (leader flat): coin=%s follower_pos=%s leader_size=%s",
+                            coin,
+                            float(position.size),
+                            float(leader_size or 0.0),
+                        )
+                if copy_size < min_sz and not force_full_close:
+                    logger.info(f"Copy size {copy_size} too small, skipping")
+                    return {
+                        "status": "skipped",
+                        "reason": "too_small",
+                        "coin": trade.coin,
+                        "action": str(trade.action),
+                        "requested_size": float(requested_size),
+                        "order_size": 0.0,
+                        "max_size": float(max_size),
+                        "max_notional_per_trade_usd": float(max_notional),
+                        "min_trade_size": float(min_sz),
+                        "capped_by_size": bool(cap_by_size),
+                        "capped_by_notional": bool(cap_by_notional),
+                        "rounded_down": bool(rounded_down),
+                        "sz_decimals": int(decimals),
+                        "follower_pos": float(position.size),
                     }
                 logger.info(
                     "EXEC CLOSE: coin=%s action=%s leader_size=%s copy_ratio=%s copy_size=%s follower_pos=%s",
@@ -594,6 +679,40 @@ class PositionManager:
                         "sz_decimals": int(decimals),
                         "follower_pos": float(pos_size),
                     }
+                force_full_close = False
+                if force_close_on_leader_flat and leader_address:
+                    leader_size = await self._get_leader_position_size(leader_address, coin)
+                    if abs(float(leader_size or 0.0)) <= 0.0:
+                        force_full = abs(float(position.size))
+                        copy_size = self._round_down(force_full, decimals)
+                        rounded_down = copy_size != force_full
+                        cap_by_size = False
+                        cap_by_notional = False
+                        force_full_close = True
+                        logger.info(
+                            "FORCE CLOSE (leader flat): coin=%s follower_pos=%s leader_size=%s",
+                            coin,
+                            float(position.size),
+                            float(leader_size or 0.0),
+                        )
+                if copy_size < min_sz and not force_full_close:
+                    logger.info(f"Copy size {copy_size} too small, skipping")
+                    return {
+                        "status": "skipped",
+                        "reason": "too_small",
+                        "coin": trade.coin,
+                        "action": str(trade.action),
+                        "requested_size": float(requested_size),
+                        "order_size": 0.0,
+                        "max_size": float(max_size),
+                        "max_notional_per_trade_usd": float(max_notional),
+                        "min_trade_size": float(min_sz),
+                        "capped_by_size": bool(cap_by_size),
+                        "capped_by_notional": bool(cap_by_notional),
+                        "rounded_down": bool(rounded_down),
+                        "sz_decimals": int(decimals),
+                        "follower_pos": float(position.size),
+                    }
                 logger.info(
                     "EXEC CLOSE: coin=%s action=%s leader_size=%s copy_ratio=%s copy_size=%s follower_pos=%s",
                     coin,
@@ -631,6 +750,23 @@ class PositionManager:
             leverage = int(getattr(trade, 'leverage', 1) or 1)
             leverage = max(1, min(leverage, int(max_leverage)))
 
+            if copy_size < min_sz:
+                logger.info(f"Copy size {copy_size} too small, skipping")
+                return {
+                    "status": "skipped",
+                    "reason": "too_small",
+                    "coin": trade.coin,
+                    "action": str(trade.action),
+                    "requested_size": float(requested_size),
+                    "order_size": 0.0,
+                    "max_size": float(max_size),
+                    "max_notional_per_trade_usd": float(max_notional),
+                    "min_trade_size": float(min_sz),
+                    "capped_by_size": bool(cap_by_size),
+                    "capped_by_notional": bool(cap_by_notional),
+                    "rounded_down": bool(rounded_down),
+                    "sz_decimals": int(decimals),
+                }
             async def _wait_no_opposite_position(*, want_buy: bool, decimals_for_eps: int) -> bool:
                 if not self._flip_wait_for_close:
                     return True
@@ -803,6 +939,27 @@ class PositionManager:
                 lock.release()
             except Exception:
                 pass
+
+    async def _get_leader_position_size(self, leader_address: str, coin: str) -> float:
+        leader_key = str(leader_address or "").lower()
+        now = time.monotonic()
+        cached_at = float(self._leader_positions_cache_at_by_addr.get(leader_key, 0.0) or 0.0)
+        cached = self._leader_positions_cache_by_addr.get(leader_key)
+        if cached and (now - cached_at) <= float(self._leader_positions_cache_ttl_s):
+            entry = cached.get(str(coin), {}) if isinstance(cached, dict) else {}
+            return float(entry.get("size", 0.0) or 0.0)
+
+        try:
+            leader_state = await asyncio.to_thread(self.info.user_state, leader_address)
+        except Exception as e:
+            logger.warning(f"Failed to fetch leader positions for {leader_address}: {e}")
+            return 0.0
+
+        positions = self._positions_from_user_state_with_entry(leader_state if isinstance(leader_state, dict) else {})
+        self._leader_positions_cache_by_addr[leader_key] = positions
+        self._leader_positions_cache_at_by_addr[leader_key] = now
+        entry = positions.get(str(coin), {}) if isinstance(positions, dict) else {}
+        return float(entry.get("size", 0.0) or 0.0)
 
     async def _refresh_sz_decimals_cache(self) -> None:
         """Refresh szDecimals cache from meta API.
